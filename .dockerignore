@@ -1,0 +1,12 @@
+.env
+.git
+output
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.venv
+**/venv
+**/node_modules
+dashboard/dist
+engine/app/static
+sdsd

@@ -1,0 +1,211 @@
+{
+  "id": "JobSearchDailyWf",
+  "name": "Job Discovery - Daily",
+  "active": false,
+  "isArchived": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kathmandu",
+    "errorWorkflow": "JobSearchErrorWf",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "executionTimeout": 14400
+  },
+  "nodes": [
+    {
+      "id": "0b7a3f5e-1d2c-4e8a-9f10-000000000001",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-420, -260],
+      "parameters": {
+        "width": 560,
+        "height": 300,
+        "color": 4,
+        "content": "## Job Discovery - Daily (phase 1: discovery & filtering)\nRuns every day at **06:00 Asia/Kathmandu**, or click *Execute workflow*.\n\n1. **Start run** - checks the CV, plans sources (job APIs, ATS boards, search, Claude web search)\n2. **Fetch sources** - polite, time-boxed batches; loops until the queue is empty\n3. **Analyse & score** - rules, then Claude matching, scoring, decisions, tailored materials; loops until done\n4. **Finish run** - stats and Telegram/email digest\n\nAny failure goes to **Job Discovery - Error Handler**.\nNo applications are ever submitted in phase 1."
+      }
+    },
+    {
+      "id": "0b7a3f5e-1d2c-4e8a-9f10-000000000002",
+      "name": "Daily 06:00 (Kathmandu)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-420, 120],
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 6 * * *" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "0b7a3f5e-1d2c-4e8a-9f10-000000000003",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-420, 300],
+      "parameters": {}
+    },
+    {
+      "id": "0b7a3f5e-1d2c-4e8a-9f10-000000000004",
+      "name": "Start run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-160, 200],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ENGINE_URL }}/api/pipeline/runs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.ENGINE_API_TOKEN }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ trigger: $json.timestamp ? 'schedule' : 'manual', n8n_execution_id: $execution.id }) }}",
+        "options": { "timeout": 120000 }
+      }
+    },
+    {
+      "id": "0b7a3f5e-1d2c-4e8a-9f10-000000000005",
+      "name": "Fetch sources (batch)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [80, 200],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ENGINE_URL }}/api/pipeline/runs/{{ $('Start run').first().json.run_id }}/fetch-next",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.ENGINE_API_TOKEN }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{ \"max_tasks\": 15, \"max_seconds\": 90 }",
+        "options": { "timeout": 300000 }
+      }
+    },
+    {
+      "id": "0b7a3f5e-1d2c-4e8a-9f10-000000000006",
+      "name": "More sources?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [320, 200],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "7e1c7a52-7f3e-4c0e-8a3b-3a1f0c5d2b11",
+              "leftValue": "={{ $json.remaining }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "0b7a3f5e-1d2c-4e8a-9f10-000000000007",
+      "name": "Analyse & score (batch)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [560, 300],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 15000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ENGINE_URL }}/api/pipeline/runs/{{ $('Start run').first().json.run_id }}/process-next",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.ENGINE_API_TOKEN }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{ \"max_items\": 6, \"max_seconds\": 240 }",
+        "options": { "timeout": 900000 }
+      }
+    },
+    {
+      "id": "0b7a3f5e-1d2c-4e8a-9f10-000000000008",
+      "name": "More to analyse?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [800, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "2d0f5a8b-6a41-4b7e-9d8c-51c9e2f3a4b7",
+              "leftValue": "={{ $json.remaining }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "0b7a3f5e-1d2c-4e8a-9f10-000000000009",
+      "name": "Finish run & notify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1040, 400],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ENGINE_URL }}/api/pipeline/runs/{{ $('Start run').first().json.run_id }}/finish",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.ENGINE_API_TOKEN }}" }
+          ]
+        },
+        "options": { "timeout": 180000 }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 06:00 (Kathmandu)": { "main": [[{ "node": "Start run", "type": "main", "index": 0 }]] },
+    "Run manually": { "main": [[{ "node": "Start run", "type": "main", "index": 0 }]] },
+    "Start run": { "main": [[{ "node": "Fetch sources (batch)", "type": "main", "index": 0 }]] },
+    "Fetch sources (batch)": { "main": [[{ "node": "More sources?", "type": "main", "index": 0 }]] },
+    "More sources?": {
+      "main": [
+        [{ "node": "Fetch sources (batch)", "type": "main", "index": 0 }],
+        [{ "node": "Analyse & score (batch)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Analyse & score (batch)": { "main": [[{ "node": "More to analyse?", "type": "main", "index": 0 }]] },
+    "More to analyse?": {
+      "main": [
+        [{ "node": "Analyse & score (batch)", "type": "main", "index": 0 }],
+        [{ "node": "Finish run & notify", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {}
+}

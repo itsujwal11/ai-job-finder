@@ -1,0 +1,86 @@
+{
+  "id": "JobSearchErrorWf",
+  "name": "Job Discovery - Error Handler",
+  "active": false,
+  "isArchived": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kathmandu",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "nodes": [
+    {
+      "id": "5c2e9d41-8b7a-4f3c-a1e2-000000000001",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-360, -200],
+      "parameters": {
+        "width": 480,
+        "height": 200,
+        "color": 3,
+        "content": "## Error handler\nTriggered when **Job Discovery - Daily** fails.\n1. Reports the failure to the engine (logs it, marks the run failed, sends Telegram/email alert).\n2. If the engine itself is unreachable, sends a Telegram alert directly (needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)."
+      }
+    },
+    {
+      "id": "5c2e9d41-8b7a-4f3c-a1e2-000000000002",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-360, 120],
+      "parameters": {}
+    },
+    {
+      "id": "5c2e9d41-8b7a-4f3c-a1e2-000000000003",
+      "name": "Report to engine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-100, 120],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ENGINE_URL }}/api/pipeline/errors",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.ENGINE_API_TOKEN }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ workflow: $json.workflow?.name, node: $json.execution?.lastNodeExecuted ?? 'trigger', message: $json.execution?.error?.message ?? $json.trigger?.error?.message ?? 'Unknown error', execution_id: $json.execution?.id, execution_url: $json.execution?.url }) }}",
+        "options": { "timeout": 60000 }
+      }
+    },
+    {
+      "id": "5c2e9d41-8b7a-4f3c-a1e2-000000000004",
+      "name": "Telegram fallback (engine unreachable)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [180, 240],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $env.TELEGRAM_CHAT_ID, text: '⚠️ Job discovery failed and the engine is unreachable.\\nWorkflow: ' + ($('Error Trigger').first().json.workflow?.name ?? '?') + '\\nNode: ' + ($('Error Trigger').first().json.execution?.lastNodeExecuted ?? '?') + '\\nError: ' + ($('Error Trigger').first().json.execution?.error?.message ?? '?') }) }}",
+        "options": { "timeout": 30000 }
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": { "main": [[{ "node": "Report to engine", "type": "main", "index": 0 }]] },
+    "Report to engine": {
+      "main": [
+        [],
+        [{ "node": "Telegram fallback (engine unreachable)", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {}
+}

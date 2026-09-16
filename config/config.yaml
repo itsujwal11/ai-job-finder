@@ -1,0 +1,286 @@
+# =============================================================================
+# AI Job Discovery - main configuration
+# Re-read at the start of every run: edit, save, and the next run picks it up.
+# ${VAR} / ${VAR:-default} are substituted from environment variables.
+# =============================================================================
+version: 1
+timezone: Asia/Kathmandu
+
+# -----------------------------------------------------------------------------
+# Decision thresholds (match score 0-100)
+# -----------------------------------------------------------------------------
+thresholds:
+  auto_apply_min: 85        # 85-100: eligible for automatic application
+  approval_min: 70          # 70-84: requires your approval; below 70: ignored
+
+# -----------------------------------------------------------------------------
+# Applications - PHASE 1: DISCOVERY & FILTERING ONLY
+# Nothing is ever submitted. Automatic submission needs BOTH this flag and the
+# AUTO_APPLY_ENABLED=true env var, AND a submitter that phase 1 does not ship.
+# -----------------------------------------------------------------------------
+applications:
+  auto_apply_enabled: false
+  duplicate_window_days: 365      # never re-apply to same company + similar title in this window
+  duplicate_title_similarity: 88  # 0-100 fuzzy match used for duplicate-application checks
+
+# -----------------------------------------------------------------------------
+# Pipeline limits (protect cost, target sites and runtime)
+# -----------------------------------------------------------------------------
+pipeline:
+  max_posting_age_days: 30
+  max_tasks_per_run: 100
+  max_pages_per_run: 20             # generic web pages fetched from search/AI discovery
+  max_boards_per_run: 40            # ATS company boards fetched per run
+  max_ai_analyses_per_run: 5
+  max_ai_extractions_per_run: 5     # pages without structured data that need AI extraction
+  analysis_concurrency: 1           # strictly sequential to avoid RPM limit issues
+  min_description_chars: 200        # shorter postings get enriched from the posting page first
+
+materials:
+  enabled: true
+  # Low-cost default: auto-generate only for 85+ matches. Use the dashboard button for others.
+  generate_for: [auto_apply_candidate, manual_apply]
+  min_score: 85
+  max_per_run: 3
+  output_dir: output/applications
+
+# -----------------------------------------------------------------------------
+# Claude
+# -----------------------------------------------------------------------------
+ai:
+  model: ${ANTHROPIC_MODEL:-claude-opus-5}
+  effort:
+    analyze: medium
+    extract: low
+    discovery: medium
+    materials: high
+    verify: medium
+  use_refusal_fallbacks: true       # server-side fallbacks="default" (Opus 5 / Fable 5.x only)
+  daily_budget_usd: 0.50            # hard stop for all AI calls per Asia/Kathmandu day
+  web_discovery:
+    enabled: false                  # Claude web search costs extra ($10 / 1000 searches) - off for low cost
+    max_searches_per_run: 8
+  # USD per million tokens - used for the budget guard. Update if prices change.
+  pricing:
+    claude-opus-5:     { input: 5.00,  output: 25.00 }
+    claude-fable-5-1:  { input: 10.00, output: 50.00 }
+    claude-sonnet-5:   { input: 2.00,  output: 10.00 }
+    claude-haiku-4-5:  { input: 1.00,  output: 5.00 }
+  web_search_usd_per_1000: 10.00
+
+# -----------------------------------------------------------------------------
+# HTTP behaviour - polite, transparent, never bypasses protections
+# -----------------------------------------------------------------------------
+http:
+  user_agent: "PersonalJobDiscovery/1.0 (+single-candidate job search; contact ${CONTACT_EMAIL:-not-set})"
+  timeout_seconds: 25
+  max_response_mb: 5
+  min_delay_per_host_seconds: 2.0
+  respect_robots_txt_for_pages: true
+  # Sites that require login / forbid automated access. Results pointing here are
+  # stored as "leads" (title + snippet only) for you to open manually. Never fetched.
+  jina_domains:
+    - linkedin.com
+    - indeed.com
+    - glassdoor.com
+    - upwork.com
+    - fiverr.com
+    - freelancer.com
+    - x.com
+    - twitter.com
+    - wellfound.com
+    - ziprecruiter.com
+    - toptal.com
+    - naukri.com
+  no_fetch_domains:
+    - facebook.com
+    - instagram.com
+
+# -----------------------------------------------------------------------------
+# Discovery sources. Nothing here is a closed list: search engines and Claude web
+# search find arbitrary career pages, and any ATS board seen anywhere is added to
+# ats_boards automatically and crawled via its official public API.
+# -----------------------------------------------------------------------------
+sources:
+  remotive:        { enabled: true,  url: "https://remotive.com/api/remote-jobs?limit=500" }
+  remoteok:        { enabled: true,  url: "https://remoteok.com/api" }
+  jobicy:          { enabled: true,  url: "https://jobicy.com/api/v2/remote-jobs?count=100", tags: [react, javascript, frontend] }
+  himalayas:       { enabled: true,  url: "https://himalayas.app/jobs/api", pages: 5, page_size: 20 }
+  weworkremotely:
+    enabled: true
+    feeds:
+      - https://weworkremotely.com/categories/remote-front-end-programming-jobs.rss
+      - https://weworkremotely.com/categories/remote-full-stack-programming-jobs.rss
+      - https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss
+      - https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss
+      - https://weworkremotely.com/categories/remote-customer-support-jobs.rss
+  workingnomads:   { enabled: true,  url: "https://www.workingnomads.com/api/exposed_jobs/" }
+  arbeitnow:       { enabled: false, url: "https://www.arbeitnow.com/api/job-board-api" }   # mostly Germany-restricted
+  hackernews:      { enabled: true,  threads: [who_is_hiring, freelancer] }
+
+ats:
+  auto_discover: true
+  disable_after_failures: 5
+  # Add company boards you already know about. Examples:
+  #   - { provider: greenhouse, slug: gitlab }
+  #   - { provider: lever, slug: some-company }
+  #   - { provider: ashby, slug: some-company }
+  seed_boards: []
+
+search:
+  # Providers are used only when their API key is set in .env.
+  providers: [brave, tavily, google_cse]
+  max_queries_per_run: 12
+  results_per_query: 10
+  freshness_days: 7
+  queries:
+    - '"junior frontend developer" remote worldwide'
+    - '"react developer" remote "anywhere in the world" junior'
+    - '"frontend intern" remote worldwide'
+    - '"junior software engineer" remote Asia'
+    - 'remote "web developer" junior "work from anywhere"'
+    - 'junior "full stack developer" remote APAC'
+    - 'remote frontend developer Nepal'
+    - 'site:jobs.lever.co remote junior frontend'
+    - 'site:boards.greenhouse.io remote junior react'
+    - 'site:jobs.ashbyhq.com remote junior engineer'
+    - '"technical support" remote worldwide entry level software'
+    - '"QA automation" junior remote worldwide'
+    - '"junior devops" OR "cloud intern" remote worldwide'
+    - 'part-time remote react developer contract'
+
+# -----------------------------------------------------------------------------
+# Deterministic filters (run before any AI call - they cost nothing)
+# -----------------------------------------------------------------------------
+relevance:
+  include_title_terms:
+    - frontend
+    - react
+    - javascript
+    - typescript
+    - web developer
+    - web engineer
+    - software engineer
+    - software developer
+    - fullstack
+    - full stack
+    - ui developer
+    - ui engineer
+    - next.js
+    - nextjs
+    - qa
+    - quality assurance
+    - test automation
+    - sdet
+    - technical support
+    - support engineer
+    - application support
+    - it support
+    - devops
+    - cloud
+    - platform engineer
+    - java developer
+    - junior developer
+    - graduate developer
+    - developer intern
+    - engineering intern
+    - software intern
+    - trainee developer
+    - programmer
+  exclude_title_terms:
+    - sales
+    - account executive
+    - marketing
+    - recruiter
+    - nurse
+    - teacher
+    - accountant
+    - lawyer
+    - ios
+    - android
+    - flutter
+    - react native
+    - golang
+    - rust
+    - embedded
+    - firmware
+    - data scientist
+    - machine learning
+    - salesforce
+    - sap
+    - .net
+    - asp.net
+    - c#
+    - c++
+    - php
+    - wordpress
+    - shopify
+    - blockchain
+    - solidity
+
+seniority:
+  blocked_title_terms: [senior, sr, staff, principal, lead, head of, director, architect, manager, vp, vice president, chief, expert, "engineer iii", "engineer iv"]
+  max_required_years: 2          # postings requiring 3+ years are blocked
+  candidate_level: junior
+
+eligibility:
+  nepal_positive_terms: [nepal, kathmandu, worldwide, anywhere, global, "work from anywhere", "any location", "all countries"]
+  region_includes_nepal: [asia, apac, "asia pacific", "asia-pacific", "south asia", "southern asia", "gmt+5:45", "utc+5:45", "npt"]
+  # Structured region names that do NOT include Nepal
+  region_excludes_nepal: [usa, "united states", us, canada, "north america", europe, eu, emea, uk, "united kingdom", latam, "latin america", "south america", germany, france, spain, australia, "new zealand", india, philippines, brazil, mexico]
+
+legitimacy:
+  known_ats_domains: [greenhouse.io, lever.co, ashbyhq.com, smartrecruiters.com, recruitee.com, workable.com, bamboohr.com, breezy.hr, personio.de, teamtailor.com, jobvite.com, icims.com, myworkdayjobs.com, rippling.com]
+  free_email_domains: [gmail.com, yahoo.com, hotmail.com, outlook.com, proton.me, protonmail.com, aol.com, icloud.com, mail.com, yandex.com]
+  strong_red_flags:
+    - registration fee
+    - training fee
+    - pay for training
+    - security deposit
+    - processing fee
+    - upfront payment
+    - send money
+    - wire transfer
+    - western union
+    - gift card
+    - purchase equipment
+    - "check to buy"
+    - pay to apply
+    - refundable deposit
+    - crypto payment
+  weak_red_flags:
+    - no interview
+    - hired immediately
+    - no experience needed earn
+    - earn per day
+    - unlimited earning
+    - telegram only
+    - whatsapp only
+    - contact on telegram
+    - contact on whatsapp
+    - data entry work from home
+  min_domain_age_days: 180
+
+# -----------------------------------------------------------------------------
+# Money
+# -----------------------------------------------------------------------------
+compensation:
+  # Approximate conversion to NPR - UPDATE periodically.
+  fx_to_npr: { NPR: 1, USD: 140, EUR: 158, GBP: 185, INR: 1.6, AUD: 92, CAD: 102, SGD: 108, AED: 38 }
+
+# -----------------------------------------------------------------------------
+# Match score weights (must sum to 100)
+# -----------------------------------------------------------------------------
+scoring:
+  weights:
+    skills_match: 35
+    experience_fit: 20
+    role_fit: 15
+    eligibility: 10
+    compensation: 10
+    growth_value: 10
+
+notifications:
+  digest_max_items: 25
+  send_when_nothing_new: false
+  alert_on_errors: true

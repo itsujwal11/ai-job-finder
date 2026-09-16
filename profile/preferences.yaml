@@ -1,0 +1,49 @@
+# Job-search preferences. These are NOT CV facts - CV facts live only in cv.md.
+# Everything the AI says about the candidate must be traceable to cv.md.
+
+candidate:
+  name: Ujwol Shrestha
+  location: Kathmandu, Nepal
+  country_code: NP
+  timezone: Asia/Kathmandu          # UTC+05:45
+  # First professional role start, taken from cv.md (Frontend Developer Intern, Nov 2025).
+  # Used to compute months of experience at analysis time.
+  professional_experience_start: "2025-11"
+  education_status: "BCA in progress (2021 - Present)"
+  # The CV shows the labels "LinkedIn | Portfolio | GitHub" without URLs.
+  # Fill these in; empty links are never added to generated materials.
+  links:
+    linkedin: ""
+    portfolio: ""
+    github: ""
+  contact_email: ujwolstha712@gmail.com
+
+targets:
+  # Primary roles score highest on role_fit; adjacent roles are considered but
+  # the AI must not claim skills the CV does not show (e.g. testing, cloud).
+  primary_roles:
+    - Frontend Developer
+    - React Developer
+    - Web Developer
+    - Junior Software Engineer
+    - Software Engineer (entry level)
+    - Full Stack Developer (junior)
+  adjacent_roles:
+    - QA Automation (junior)
+    - Technical Support / Application Support
+    - Junior DevOps
+    - Cloud / Platform internship
+    - UI Developer
+    - Java Developer (junior)
+  employment_types: [full_time, part_time, internship, contract, freelance, temporary]
+  seniority: [intern, entry, junior]
+  work_arrangement:
+    remote: preferred
+    # Onsite/hybrid roles located in Nepal are kept but always need your approval.
+    onsite_or_hybrid_in_nepal: allowed_with_approval
+    onsite_outside_nepal: never
+
+compensation:
+  min_monthly_npr: 20000
+  # Lower-paying roles are still considered when they give meaningful experience.
+  allow_below_minimum_for: [internship, freelance, part_time]

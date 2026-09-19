@@ -19,18 +19,36 @@ _GENERIC_TECH_TITLE = re.compile(r"\b(developer|engineer|programmer|intern|train
 _CANDIDATE_STACK = re.compile(r"\b(react|typescript|javascript|frontend|front-end|next\.?js)\b")
 
 
-def assess_relevance(title: str, description: str, cfg: Config) -> tuple[bool, str]:
+NEPAL_PLACES = ("nepal", "kathmandu", "lalitpur", "bhaktapur", "pokhara", "biratnagar", "butwal", "chitwan")
+
+
+def is_nepal_local(location_text: str | None, source: str | None, cfg: Config) -> bool:
+    """True when the posting is clearly aimed at the Nepali market.
+
+    Used to relax the technology-stack exclusions. Worldwide-remote listings are filtered hard
+    because there are thousands of them, but the Kathmandu market is small and runs on stacks
+    (PHP/Laravel, .NET, Java, WordPress) that are worth a look even though the CV is React-first.
+    """
+    if source and source in set(cfg.terms("local_boards.sources") or []):
+        return True
+    location = ascii_lower(location_text)
+    return any(contains_term(location, place) for place in NEPAL_PLACES)
+
+
+def assess_relevance(title: str, description: str, cfg: Config, *, nepal_local: bool = False) -> tuple[bool, str]:
     t = ascii_lower(title)
     excluded = first_term(t, cfg.terms("relevance.exclude_title_terms"))
-    if excluded:
+    if excluded and not (nepal_local and excluded in cfg.terms("relevance.nepal_relaxed_exclude_terms")):
         return False, f"Title matches excluded term '{excluded}'"
-    included = first_term(t, cfg.terms("relevance.include_title_terms"))
+    include_terms = cfg.terms("relevance.include_title_terms")
+    if nepal_local:
+        include_terms = include_terms + cfg.terms("relevance.nepal_extra_include_terms")
+    included = first_term(t, include_terms)
     if included:
         return True, f"Title matches target term '{included}'"
     if _GENERIC_TECH_TITLE.search(t) and _CANDIDATE_STACK.search(ascii_lower(description)):
         return True, "Generic technical title and posting mentions the candidate's stack"
     return False, "Title is not related to the target roles"
-
 
 # ---------------------------------------------------------------------------
 # Seniority & years of experience
@@ -227,7 +245,9 @@ def detect_apply_method(apply_url: str | None, apply_email: str | None, descript
         host = host_of(apply_url)
         if host_matches(host, cfg.terms("legitimacy.known_ats_domains")):
             return "ats_form", None
-        if host_matches(host, cfg.terms("http.no_fetch_domains")):
+        # Both lists are sites you have to open and apply on yourself: no_fetch_domains are never
+        # touched, jina_domains are readable only through a reader proxy and still need a login.
+        if host_matches(host, cfg.terms("http.no_fetch_domains") + cfg.terms("http.jina_domains")):
             return "login_required", None
         return "external_form", None
     for sentence in re.split(r"(?<=[.!?])\s+|\n", description):

@@ -165,6 +165,12 @@ class Env:
             notify_email_to=_str("NOTIFY_EMAIL_TO"),
         )
 
+    def ai_model(self, cfg_model: str | None = None) -> str | None:
+        """The model that will really be called, which for openai_compatible is OPENAI_MODEL."""
+        if self.ai_provider == "openai_compatible":
+            return self.openai_model
+        return cfg_model
+
     @property
     def ai_available(self) -> bool:
         if self.ai_provider == "openai_compatible":

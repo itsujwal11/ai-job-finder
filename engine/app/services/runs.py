@@ -8,7 +8,7 @@ from .. import db
 from ..config import Config, Env, get_env, load_config
 from ..events import log_event
 from ..profile import load_profile
-from .tasks import PRIORITY, board_url, enqueue
+from .tasks import PRIORITY, board_url, enqueue, page_source
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +94,12 @@ def plan_tasks(conn, run_id: int, cfg: Config, env: Env) -> dict[str, int]:
             params = {k: v for k, v in source.items() if k not in ("enabled", "url")}
             add("feed", name, name.title(), source["url"], params)
 
+    for board in cfg.get("local_boards.boards") or []:
+        if not board.get("enabled", True):
+            continue
+        add("local_board", board["name"], f"Local board: {board.get('label') or board['name']}", board["sitemap"],
+            {k: v for k, v in board.items() if k not in ("name", "sitemap", "enabled", "label")})
+
     for seed in cfg.get("ats.seed_boards") or []:
         db.execute(
             "INSERT INTO ats_boards (provider, slug, company_name, discovered_via) VALUES (%s, %s, %s, 'seed')"
@@ -128,13 +134,17 @@ def plan_tasks(conn, run_id: int, cfg: Config, env: Env) -> dict[str, int]:
     if env.ai_available and cfg.get("ai.web_discovery.enabled", True):
         add("ai_discovery", "claude", "Claude web search discovery", "ai://discovery")
 
+    # Leftovers from earlier runs are retried first, but they must not eat the whole page budget:
+    # links found later in *this* run (local job boards, search results) need room too.
+    page_budget = int(cfg.get("pipeline.max_pages_per_run", 60))
     pending_pages = db.fetch_all(
-        "SELECT url FROM discovered_urls WHERE status = 'pending' AND attempts < 3 ORDER BY first_seen_at LIMIT %s",
-        (int(cfg.get("pipeline.max_pages_per_run", 60)),),
+        "SELECT url, discovered_via FROM discovered_urls WHERE status = 'pending' AND attempts < 3"
+        " ORDER BY first_seen_at LIMIT %s",
+        (max(1, int(page_budget * float(cfg.get("pipeline.pending_pages_share", 0.5)))),),
         conn,
     )
     for page in pending_pages:
-        add("page", "web", page["url"][:120], page["url"])
+        add("page", page_source(page["discovered_via"]), page["url"][:120], page["url"])
     return planned
 
 
@@ -199,6 +209,16 @@ def finish_run(run_id: int) -> dict[str, Any]:
     )
     log_event("run_completed", f"Run #{run_id} completed", run_id=run_id, data=stats)
     return {"run_id": run_id, "status": "completed", "stats": stats, "notifications": notifications}
+
+
+def record_failure(run_id: int, error: str) -> None:
+    """Mark a run failed so it never blocks the next one (see the 'only one running' guard)."""
+    db.execute(
+        "UPDATE runs SET status = 'failed', stage = 'done', finished_at = now(), error = %s"
+        " WHERE id = %s AND status = 'running'",
+        (error[:1000], run_id),
+    )
+    log_event("run_failed", f"Run #{run_id} failed: {error[:300]}", level="error", run_id=run_id)
 
 
 def record_error(payload: dict[str, Any]) -> dict[str, Any]:

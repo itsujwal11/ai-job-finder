@@ -28,11 +28,16 @@ applications:
 # -----------------------------------------------------------------------------
 pipeline:
   max_posting_age_days: 30
-  max_tasks_per_run: 100
-  max_pages_per_run: 20             # generic web pages fetched from search/AI discovery
+  max_tasks_per_run: 200
+  max_pages_per_run: 90             # web pages from search, AI discovery and local job boards
+  # Share of that budget given to pages left over from earlier runs. The rest stays free for
+  # links found during this run, so a backlog can never starve the local job boards.
+  pending_pages_share: 0.5
   max_boards_per_run: 40            # ATS company boards fetched per run
-  max_ai_analyses_per_run: 5
-  max_ai_extractions_per_run: 5     # pages without structured data that need AI extraction
+  # Postings are analysed best-first (see pipeline/prescore.py), so a modest cap still spends
+  # the AI budget on the strongest candidates. Raise once you are on a paid API key.
+  max_ai_analyses_per_run: 20
+  max_ai_extractions_per_run: 8     # pages without structured data that need AI extraction
   analysis_concurrency: 1           # strictly sequential to avoid RPM limit issues
   min_description_chars: 200        # shorter postings get enriched from the posting page first
 
@@ -57,6 +62,19 @@ ai:
     verify: medium
   use_refusal_fallbacks: true       # server-side fallbacks="default" (Opus 5 / Fable 5.x only)
   daily_budget_usd: 0.50            # hard stop for all AI calls per Asia/Kathmandu day
+  # Free API tiers reject bursts with HTTP 429 long before the daily quota is gone, so the
+  # engine paces itself. Gemini free tier is 10 RPM; raise this if you move to a paid key.
+  max_requests_per_minute: 8
+  max_retries: 4                    # retries on 429/503 with Retry-After honoured
+  # Tried in order when AI_PROVIDER=openai_compatible, starting with OPENAI_MODEL. A model that
+  # reports its per-day quota is gone is skipped for the rest of the day and the run continues on
+  # the next one. Gemini free tier is metered per model and per day:
+  #   gemini-2.5-flash       20 requests/day   - runs out almost immediately
+  #   gemini-2.5-flash-lite  far higher        - the sensible default
+  # `python -m app.cli quota` prints what each one has left right now.
+  model_fallbacks:
+    - gemini-2.5-flash-lite
+    - gemini-2.5-flash
   web_discovery:
     enabled: false                  # Claude web search costs extra ($10 / 1000 searches) - off for low cost
     max_searches_per_run: 8
@@ -66,6 +84,14 @@ ai:
     claude-fable-5-1:  { input: 10.00, output: 50.00 }
     claude-sonnet-5:   { input: 2.00,  output: 10.00 }
     claude-haiku-4-5:  { input: 1.00,  output: 5.00 }
+    # OpenAI-compatible providers (AI_PROVIDER=openai_compatible). Free tiers still cost $0,
+    # but the figures keep the budget guard meaningful if you switch to a paid key.
+    gemini-2.5-flash-lite: { input: 0.10, output: 0.40 }
+    gemini-2.5-flash:      { input: 0.30, output: 2.50 }
+    gemini-2.5-pro:        { input: 1.25, output: 10.00 }
+    gemini-2.0-flash:      { input: 0.10, output: 0.40 }
+    # Used for any model without an entry above.
+    default:               { input: 1.00, output: 5.00 }
   web_search_usd_per_1000: 10.00
 
 # -----------------------------------------------------------------------------
@@ -117,6 +143,50 @@ sources:
   workingnomads:   { enabled: true,  url: "https://www.workingnomads.com/api/exposed_jobs/" }
   arbeitnow:       { enabled: false, url: "https://www.arbeitnow.com/api/job-board-api" }   # mostly Germany-restricted
   hackernews:      { enabled: true,  threads: [who_is_hiring, freelancer] }
+  # Ojiiz (ojiiz.com) - public listing API, no key needed. Categories are the site's own names;
+  # drop or add entries to change what is pulled. Company names sit behind their paid unlock,
+  # so these arrive without a company and are worth opening on the site itself.
+  ojiiz:
+    enabled: true
+    url: "https://api.ojiiz.com/api/jobs"
+    page_size: 100
+    pages: 1
+    categories:
+      - "Web Development"
+      - "UI/UX Designer"
+      - "DevOps/Database"
+      - "AI/ML/Computer Vision"
+      - "Customer Support"
+      - "CMS"
+
+# -----------------------------------------------------------------------------
+# Nepali job boards. None has an API, but every detail page carries a schema.org
+# JobPosting block, so the sitemap gives the URLs and page.py parses them for free
+# (no AI call). robots.txt and the per-host delay apply to every request.
+# -----------------------------------------------------------------------------
+local_boards:
+  # Postings from these sources are treated as "Nepal local market": the stack exclusions in
+  # relevance.nepal_relaxed_exclude_terms do not apply to them.
+  sources: [merojob, froxjob, jobaxle, ojiiz]
+  boards:
+    - name: merojob
+      label: "merojob.com"
+      enabled: true
+      sitemap: "https://merojob.com/sitemap.xml"
+      sitemap_pattern: "job_post"        # which child sitemap of the index to read
+      max_urls: 30
+    - name: froxjob
+      label: "froxjob.com"
+      enabled: true
+      sitemap: "https://froxjob.com/sitemap.xml"
+      sitemap_pattern: "jobs"
+      max_urls: 30
+    - name: jobaxle
+      label: "jobaxle.com"
+      enabled: true
+      sitemap: "https://jobaxle.com/sitemap.xml"
+      job_url_pattern: "/jobs/"          # its sitemap has no lastmod; newest entries are last
+      max_urls: 25
 
 ats:
   auto_discover: true
@@ -217,6 +287,32 @@ relevance:
     - shopify
     - blockchain
     - solidity
+  # These exclusions are lifted for jobs in the Nepali market (local_boards.sources, or a
+  # Nepal location): the Kathmandu market runs on these stacks and the roles are still junior
+  # web work. Worldwide-remote listings keep the full exclusion list.
+  nepal_relaxed_exclude_terms:
+    - php
+    - wordpress
+    - shopify
+    - .net
+    - asp.net
+    - c#
+    - android
+    - flutter
+    - react native
+  # Extra title terms that only count for Nepal-market postings.
+  nepal_extra_include_terms:
+    - laravel
+    - php developer
+    - wordpress developer
+    - it officer
+    - it executive
+    - it assistant
+    - mis officer
+    - system administrator
+    - network engineer
+    - software trainee
+    - associate software
 
 seniority:
   blocked_title_terms: [senior, sr, staff, principal, lead, head of, director, architect, manager, vp, vice president, chief, expert, "engineer iii", "engineer iv"]

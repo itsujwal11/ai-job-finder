@@ -14,7 +14,7 @@ from ..ai import AIUnavailable, BudgetExceeded, create_ai_service
 from ..config import ConfigError, get_env, load_config
 from ..events import log_event
 from ..profile import ProfileError, load_profile
-from ..services import apply, materials as materials_service
+from ..services import apply, driver, materials as materials_service, runs as runs_service
 
 router = APIRouter(prefix="/api/ui", tags=["dashboard"])
 
@@ -34,11 +34,13 @@ SORTS = {
     "score": "match_score DESC NULLS LAST, first_seen_at DESC",
     "newest": "first_seen_at DESC",
     "posted": "posted_at DESC NULLS LAST, first_seen_at DESC",
+    "prescore": "prescore DESC NULLS LAST, first_seen_at DESC",
 }
 LIST_COLUMNS = (
     "id, title, company_name, source, source_url, location_text, remote_type, employment_type, salary_npr_monthly_min,"
     " salary_npr_monthly_max, match_score, recommendation, review_status, pipeline_status, nepal_eligibility,"
-    " legitimacy_verdict, apply_method, materials_status, first_seen_at, posted_at, filter_reasons, duplicate_of"
+    " legitimacy_verdict, apply_method, materials_status, first_seen_at, posted_at, filter_reasons, duplicate_of,"
+    " prescore"
 )
 
 
@@ -66,7 +68,8 @@ def system_status() -> dict[str, Any]:
         profile_info = {"ok": False, "error": str(exc)}
         warnings.append(str(exc))
     if not env.ai_available:
-        warnings.append("AI API Key is not set - AI matching is paused (rule-based filtering still runs)")
+        missing = ("OPENAI_BASE_URL / OPENAI_MODEL" if env.ai_provider == "openai_compatible" else "ANTHROPIC_API_KEY")
+        warnings.append(f"{missing} is not set - AI matching is paused (rule-based filtering still runs)")
     if not env.search_providers():
         warnings.append("No search API key (Brave / Tavily / Google) - search-engine discovery is off")
     if not (env.telegram_enabled or env.email_enabled):
@@ -74,7 +77,8 @@ def system_status() -> dict[str, Any]:
     auto_config = bool(cfg.get("applications.auto_apply_enabled")) if cfg else False
     return {
         "profile": profile_info,
-        "ai": {"configured": env.ai_available, "model": cfg.get("ai.model") if cfg else None,
+        "ai": {"configured": env.ai_available, "provider": env.ai_provider,
+               "model": env.ai_model(cfg.get("ai.model") if cfg else None),
                "daily_budget_usd": float(cfg.get("ai.daily_budget_usd", 0)) if cfg else 0},
         "search_providers": env.search_providers(),
         "notifications": {"telegram": env.telegram_enabled, "email": env.email_enabled},
@@ -349,6 +353,30 @@ def update_application(application_id: int, body: ApplicationUpdate) -> dict[str
         raise HTTPException(status_code=404, detail="Application not found")
     log_event("application_updated", f"Application #{application_id} -> {row['status']}", opportunity_id=row["opportunity_id"])
     return row
+
+
+@router.post("/runs")
+def start_run() -> dict[str, Any]:
+    """Start a run and drive it to completion in the background (the dashboard's Run now)."""
+    try:
+        started = runs_service.start_run("dashboard")
+    except runs_service.RunConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ProfileError, ConfigError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        driver.start_background(started["run_id"])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return started
+
+
+@router.get("/runs/active")
+def active_run() -> dict[str, Any]:
+    run = db.fetch_one(
+        "SELECT id, trigger, status, stage, started_at, stats FROM runs WHERE status = 'running' ORDER BY id DESC LIMIT 1"
+    )
+    return {"run": run, "driving": driver.is_driving()}
 
 
 @router.get("/runs")

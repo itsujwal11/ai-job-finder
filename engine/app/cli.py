@@ -1,6 +1,7 @@
 """Command-line tools.
 
     python -m app.cli check                 verify config, CV, database, keys, channels
+    python -m app.cli quota                 show which AI models still have quota today
     python -m app.cli run                   run the full pipeline once without n8n
     python -m app.cli notify-test           send a test notification
     python -m app.cli export-schemas        write JSON schemas to schemas/
@@ -28,7 +29,8 @@ def cmd_check(_: argparse.Namespace) -> int:
     env = get_env()
     try:
         cfg = load_config()
-        print(f"[ok] config ({cfg.digest}) model={cfg.get('ai.model')} budget=${cfg.get('ai.daily_budget_usd')}/day")
+        print(f"[ok] config ({cfg.digest}) provider={env.ai_provider} model={env.ai_model(cfg.get('ai.model'))}"
+              f" budget=${cfg.get('ai.daily_budget_usd')}/day rpm={cfg.get('ai.max_requests_per_minute')}")
     except ConfigError as exc:
         print(f"[FAIL] config: {exc}")
         ok = False
@@ -47,11 +49,51 @@ def cmd_check(_: argparse.Namespace) -> int:
     token = env.engine_api_token or ""
     print(("[ok] " if len(token) >= 24 and not token.startswith("change-me") else "[FAIL] ") + "ENGINE_API_TOKEN")
     ok = ok and len(token) >= 24 and not token.startswith("change-me")
-    print(("[ok] " if env.ai_available else "[warn] ") + "ANTHROPIC_API_KEY " + ("set" if env.ai_available else "missing - AI analysis paused"))
+    key_name = "OPENAI_BASE_URL / OPENAI_MODEL" if env.ai_provider == "openai_compatible" else "ANTHROPIC_API_KEY"
+    print(("[ok] " if env.ai_available else "[warn] ") + key_name + (" set" if env.ai_available else " missing - AI analysis paused"))
     print(f"[info] search providers: {', '.join(env.search_providers()) or 'none'}")
     print(f"[info] notifications: telegram={env.telegram_enabled} email={env.email_enabled}")
     print(f"[info] auto-apply: config={load_config().get('applications.auto_apply_enabled') if ok else '?'} env={env.auto_apply_enabled} (phase 1: never submits)")
     return 0 if ok else 1
+
+
+def cmd_quota(_: argparse.Namespace) -> int:
+    """Ask each configured model for a one-token reply and report what its quota says."""
+    import re
+
+    import httpx
+
+    env = get_env()
+    cfg = load_config()
+    if env.ai_provider != "openai_compatible":
+        print("[info] quota probing only applies to AI_PROVIDER=openai_compatible")
+        return 0
+    models = list(dict.fromkeys([env.openai_model] + [str(m) for m in (cfg.get("ai.model_fallbacks") or [])]))
+    url = (env.openai_base_url or "").rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {env.openai_api_key}"} if env.openai_api_key else {}
+    usable = 0
+    for model in models:
+        body = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
+        try:
+            response = httpx.post(url, json=body, headers=headers, timeout=60)
+        except httpx.HTTPError as exc:
+            print(f"[FAIL] {model:24} unreachable: {type(exc).__name__}")
+            continue
+        if response.status_code == 200:
+            usable += 1
+            print(f"[ok]   {model:24} quota available")
+        elif response.status_code == 429:
+            quota = re.search(r'"quotaId":\s*"([^"]+)".*?"quotaValue":\s*"(\d+)"', response.text, re.S)
+            detail = f"{quota.group(1)} = {quota.group(2)}" if quota else "rate limited"
+            print(f"[warn] {model:24} out of quota ({detail})")
+        elif response.status_code == 404:
+            print(f"[warn] {model:24} not served on this key (HTTP 404)")
+        else:
+            print(f"[FAIL] {model:24} HTTP {response.status_code}: {response.text[:120]}")
+    print(f"[info] {usable} of {len(models)} model(s) usable right now")
+    if not usable:
+        print("[info] add another model to ai.model_fallbacks in config/config.yaml, or use a paid key")
+    return 0 if usable else 1
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -112,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check").set_defaults(fn=cmd_check)
+    sub.add_parser("quota").set_defaults(fn=cmd_quota)
     run = sub.add_parser("run")
     run.add_argument("--max-batches", type=int, default=100)
     run.set_defaults(fn=cmd_run)

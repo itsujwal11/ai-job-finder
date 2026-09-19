@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+import random
+import threading
+import time
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Any, TypeVar
 
 import anthropic
@@ -27,6 +31,45 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 MAX_POSTING_CHARS = 24_000
 
 
+#: HTTP statuses that mean "busy / over quota, try again shortly" rather than "wrong request".
+RETRYABLE_STATUS = (408, 409, 425, 429, 500, 502, 503, 504, 529)
+
+#: Models we have already warned about having no pricing entry (keeps logs readable).
+_unpriced_warned: set[str] = set()
+
+#: model -> the local date on which its per-day quota ran out. Process-wide, so every run in
+#: the same day skips a model that is already spent instead of re-discovering it.
+_exhausted_today: dict[str, "date"] = {}
+
+
+class RateLimiter:
+    """Spreads requests evenly so a provider's requests-per-minute cap is never exceeded.
+
+    Free API tiers (Gemini, Groq, OpenRouter, ...) reject bursts with HTTP 429 even when the
+    daily quota is untouched, so the engine paces itself instead of relying on retries alone.
+    """
+
+    def __init__(self, per_minute: float):
+        self.interval = 60.0 / per_minute if per_minute and per_minute > 0 else 0.0
+        self._next_free = 0.0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        if self.interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait = max(0.0, self._next_free - now)
+            self._next_free = max(now, self._next_free) + self.interval
+        if wait > 0:
+            time.sleep(wait)
+
+    def pause_until(self, seconds_from_now: float) -> None:
+        """Push every pending request back, e.g. after the server sent Retry-After."""
+        with self._lock:
+            self._next_free = max(self._next_free, time.monotonic() + seconds_from_now)
+
+
 class AIError(RuntimeError):
     """A single AI call failed; the item can be retried in a later run."""
 
@@ -41,6 +84,10 @@ class BudgetExceeded(AIError):
 
 class AIRefused(AIError):
     pass
+
+
+class _QuotaExhausted(AIError):
+    """Internal: this model is spent for today. Callers fall through to the next model."""
 
 
 def load_prompt(name: str) -> str:
@@ -105,9 +152,12 @@ class ClaudeService:
     def _price(self, model: str) -> dict[str, float]:
         pricing: dict[str, dict[str, float]] = self.cfg.get("ai.pricing", {}) or {}
         for key in sorted(pricing, key=len, reverse=True):
-            if model.startswith(key):
+            if key != "default" and model.startswith(key):
                 return pricing[key]
-        return pricing.get(self.model) or {"input": 5.0, "output": 25.0}
+        if model not in _unpriced_warned:
+            _unpriced_warned.add(model)
+            log.warning("No ai.pricing entry for model %r - using ai.pricing.default for the budget guard", model)
+        return pricing.get("default") or {"input": 5.0, "output": 25.0}
 
     def _record(self, purpose: str, message: Any, run_id: int | None, opportunity_id: int | None, ok: bool = True) -> None:
         usage = message.usage
@@ -341,34 +391,123 @@ class OpenAICompatibleService(ClaudeService):
         self.env = env
         self.profile = profile
         self.model = env.openai_model
+        # Free tiers are metered per model, so a chain lets the run continue on the next model
+        # instead of stopping the moment the primary one runs out for the day.
+        self.models: list[str] = list(dict.fromkeys(
+            [env.openai_model] + [str(m) for m in (cfg.get("ai.model_fallbacks") or [])]
+        ))
         self.url = env.openai_base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {env.openai_api_key}"} if env.openai_api_key else {}
         self.http = httpx.Client(timeout=300, headers=headers)
+        self.limiter = RateLimiter(float(cfg.get("ai.max_requests_per_minute", 10) or 0))
+        self.max_retries = int(cfg.get("ai.max_retries", 4))
 
     def _record_openai(self, purpose: str, data: dict[str, Any], run_id: int | None, opportunity_id: int | None, ok: bool) -> None:
         usage = data.get("usage") or {}
+        model = str(data.get("model") or self.model)
+        input_tokens = int(usage.get("prompt_tokens") or 0)
+        output_tokens = int(usage.get("completion_tokens") or 0)
+        cached = int(((usage.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+        price = self._price(model)
+        cost = (
+            max(0, input_tokens - cached) * price["input"]
+            + cached * price["input"] * 0.25
+            + output_tokens * price["output"]
+        ) / 1_000_000
         db.execute(
-            "INSERT INTO ai_usage (run_id, opportunity_id, purpose, model, input_tokens, output_tokens, cost_usd, ok)"
-            " VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
-            (run_id, opportunity_id, purpose, str(data.get("model") or self.model),
-             int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), ok),
+            "INSERT INTO ai_usage (run_id, opportunity_id, purpose, model, input_tokens, output_tokens,"
+            " cache_read_tokens, cost_usd, ok) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (run_id, opportunity_id, purpose, model, input_tokens, output_tokens, cached, round(cost, 6), ok),
         )
 
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response, attempt: int) -> float:
+        """Honour Retry-After when the server sends one, else exponential backoff with jitter."""
+        header = response.headers.get("retry-after", "")
+        if header.strip().isdigit():
+            return min(120.0, float(header.strip()))
+        body = response.text[:2000]
+        marker = '"retryDelay":"'                     # Google returns this inside the error payload
+        if marker in body:
+            value = body.split(marker, 1)[1].split('"', 1)[0].removesuffix("s")
+            try:
+                return min(120.0, float(value))
+            except ValueError:
+                pass
+        return min(60.0, (2.0 ** attempt) + random.uniform(0, 1.0))
+
+    @staticmethod
+    def _is_daily_quota(text: str) -> bool:
+        """Tell a per-day quota ('come back tomorrow') from a per-minute one ('slow down')."""
+        return "PerDay" in text or "per day" in text.lower()
+
+    def _today(self) -> date:
+        return datetime.now(ZoneInfo(str(self.cfg.get("timezone", "UTC")))).date()
+
+    def available_models(self) -> list[str]:
+        today = self._today()
+        return [m for m in self.models if _exhausted_today.get(m) != today]
+
     def _post(self, body: dict[str, Any]) -> dict[str, Any]:
-        try:
-            response = self.http.post(self.url, json=body)
-            if response.status_code == 400 and "response_format" in body:
-                body = {k: v for k, v in body.items() if k != "response_format"}
+        """Send one chat completion, walking down the model chain past exhausted models."""
+        models = self.available_models()
+        if not models:
+            raise AIUnavailable(
+                f"Every configured model is out of quota for today ({', '.join(self.models)}). "
+                "Add another model to ai.model_fallbacks, or switch to a paid key."
+            )
+        last_error = ""
+        for model in models:
+            try:
+                data = self._post_one({**body, "model": model})
+            except _QuotaExhausted as exc:
+                _exhausted_today[model] = self._today()
+                last_error = str(exc)
+                log.warning("Model %s is out of quota for today - falling back to the next model", model)
+                continue
+            self.model = model          # what actually answered, for usage records and the dashboard
+            return data
+        raise AIUnavailable(f"All models are out of quota for today. Last error: {last_error[:300]}")
+
+    def _post_one(self, body: dict[str, Any]) -> dict[str, Any]:
+        last_status, last_text = 0, ""
+        for attempt in range(self.max_retries + 1):
+            self.limiter.acquire()
+            try:
                 response = self.http.post(self.url, json=body)
-        except httpx.HTTPError as exc:
-            raise AIError(f"Could not reach AI API at {self.url}: {type(exc).__name__}") from exc
-        if response.status_code in (401, 403):
-            raise AIUnavailable(f"AI API rejected the key (HTTP {response.status_code})")
-        if response.status_code == 404:
-            raise AIUnavailable(f"AI API endpoint or model not found (HTTP 404) - check OPENAI_BASE_URL / OPENAI_MODEL")
-        if response.status_code >= 400:
-            raise AIError(f"AI API error {response.status_code}: {response.text[:300]}")
-        return response.json()
+                if response.status_code == 400 and "response_format" in body:
+                    # Some providers reject json_object mode; drop it and rely on the prompt.
+                    body = {k: v for k, v in body.items() if k != "response_format"}
+                    self.limiter.acquire()
+                    response = self.http.post(self.url, json=body)
+            except httpx.HTTPError as exc:
+                if attempt < self.max_retries:
+                    time.sleep(min(30.0, 2.0 ** attempt))
+                    continue
+                raise AIError(f"Could not reach AI API at {self.url}: {type(exc).__name__}") from exc
+
+            if response.status_code in (401, 403):
+                raise AIUnavailable(f"AI API rejected the key (HTTP {response.status_code})")
+            if response.status_code == 404:
+                raise _QuotaExhausted(f"Model {body.get('model')} is not available on this key (HTTP 404)")
+            if response.status_code in RETRYABLE_STATUS:
+                last_status, last_text = response.status_code, response.text[:400]
+                # A daily quota will not clear by waiting, so stop and let the caller try another model.
+                if response.status_code == 429 and self._is_daily_quota(response.text):
+                    raise _QuotaExhausted(f"Daily quota exhausted for {body.get('model')}")
+                if attempt < self.max_retries:
+                    delay = self._retry_after_seconds(response, attempt)
+                    self.limiter.pause_until(delay)
+                    log.info("AI API busy (HTTP %s) - retrying in %.1fs (attempt %s/%s)",
+                             last_status, delay, attempt + 1, self.max_retries)
+                    time.sleep(delay)
+                    continue
+                raise _QuotaExhausted(f"{body.get('model')} still returning HTTP {last_status} after "
+                                      f"{self.max_retries} retries: {last_text}")
+            if response.status_code >= 400:
+                raise AIError(f"AI API error {response.status_code}: {response.text[:300]}")
+            return response.json()
+        raise AIError(f"AI API error {last_status}: {last_text}")
 
     def _parse(self, *, purpose: str, prompt: str, user_content: str, output_model: type[T],
                effort_key: str, run_id: int | None, opportunity_id: int | None) -> T:
@@ -381,7 +520,7 @@ class OpenAICompatibleService(ClaudeService):
         messages: list[dict[str, str]] = [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
         last_error = "no response"
         for _ in range(2):
-            data = self._post({"model": self.model, "messages": messages, "temperature": 0.2, "response_format": {"type": "json_object"}})
+            data = self._post({"messages": messages, "temperature": 0.2, "response_format": {"type": "json_object"}})
             text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
             try:
                 result = output_model.model_validate_json(_extract_json(text))

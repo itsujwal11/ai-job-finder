@@ -177,3 +177,9 @@ details summary { cursor: pointer; font-weight: 600; }
   .match-chips { grid-column: 2; justify-content: flex-start; }
   .funnel-row { grid-template-columns: 110px 1fr 36px; }
 }
+
+/* Run now control ---------------------------------------------------------- */
+.page-head { align-items: flex-start; }
+.btn[disabled] { opacity: 0.6; cursor: progress; }
+.run-now { display: flex; align-items: center; gap: 10px; }
+.run-now-error { color: var(--bad, #c0392b); font-size: 13px; max-width: 320px; }

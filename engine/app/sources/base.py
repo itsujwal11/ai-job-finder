@@ -55,6 +55,9 @@ class FetchResponse:
     status: int
     content_type: str
     text: str
+    #: Undecoded body. Needed for binary payloads such as gzipped sitemaps, where `text`
+    #: is lossy because it was decoded with errors="replace".
+    content: bytes = b""
 
     def json(self) -> Any:
         try:
@@ -153,7 +156,7 @@ class PoliteClient:
             raise FetchError(f"HTTP {status} from {safe_url}", status)
         if "html" in content_type and len(text) < 40_000 and any(m in head for m in _CHALLENGE_MARKERS):
             raise BlockedError(f"Anti-bot challenge page at {host} - skipped", status)
-        return FetchResponse(url=final_url, status=status, content_type=content_type, text=text)
+        return FetchResponse(url=final_url, status=status, content_type=content_type, text=text, content=body)
 
     def get(
         self,

@@ -8,7 +8,8 @@ import psycopg
 from .. import db
 from ..config import Config
 
-PRIORITY = {"feed": 10, "hn": 15, "ats_board": 20, "ats_board_discovered": 25, "search": 30, "ai_discovery": 40, "page": 60}
+PRIORITY = {"feed": 10, "local_board": 12, "hn": 15, "ats_board": 20, "ats_board_discovered": 25,
+            "search": 30, "ai_discovery": 40, "page": 60}
 
 
 def enqueue(
@@ -53,6 +54,16 @@ def enqueue_within_caps(
     if cap_key and count_tasks(conn, run_id, kind) >= int(cfg.get(cap_key, 50)):
         return False
     return enqueue(conn, run_id, kind, source, label, url, params, priority)
+
+
+def page_source(discovered_via: str | None) -> str:
+    """Page tasks keep the name of the board that produced the link, else the generic "web".
+
+    Used both when a link is first stored and when a still-pending link is re-queued on a later
+    run, so a posting parsed from merojob is attributed to merojob either way.
+    """
+    via = discovered_via or ""
+    return via.split(":", 1)[1] if via.startswith("local_board:") else "web"
 
 
 def board_url(provider: str, slug: str) -> str:

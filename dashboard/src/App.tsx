@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, useData, useHash } from "./api";
+import Guide from "./Guide";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Opp = Record<string, any>;
@@ -73,7 +74,7 @@ export default function App() {
     <div className="shell">
       <nav className="nav">
         <div className="brand">🔎 Job Discovery</div>
-        {[["", "Overview"], ["opportunities", "Opportunities"], ["applications", "Applications"], ["runs", "Runs & logs"]].map(([key, label]) => (
+        {[["", "Overview"], ["opportunities", "Opportunities"], ["applications", "Applications"], ["runs", "Runs & logs"], ["guide", "How it works"]].map(([key, label]) => (
           <a key={key} href={`#/${key}`} className={section === key ? "active" : ""}>{label}</a>
         ))}
       </nav>
@@ -82,23 +83,69 @@ export default function App() {
          run ? <RunDetail id={Number(run[1])} /> :
          section === "opportunities" ? <Opportunities view={params.get("view") || "ready"} /> :
          section === "applications" ? <Applications /> :
-         section === "runs" ? <Runs /> : <Overview />}
+         section === "runs" ? <Runs /> :
+         section === "guide" ? <Guide /> : <Overview />}
       </main>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
+/** Starts a run in the engine and polls until it finishes. Works with or without n8n. */
+function RunNowButton({ onDone }: { onDone?: () => void }) {
+  const [state, setState] = useState<{ busy: boolean; stage?: string; error?: string }>({ busy: false });
+
+  useEffect(() => {
+    let live = true;
+    const poll = async () => {
+      try {
+        const d = await api<any>("/runs/active");
+        if (!live) return;
+        if (d.run) setState({ busy: true, stage: `run #${d.run.id} · ${d.run.stage}` });
+        else setState((s) => (s.busy ? (onDone?.(), { busy: false }) : s));
+      } catch {
+        /* keep the last state; the next tick retries */
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 5000);
+    return () => { live = false; clearInterval(timer); };
+  }, [onDone]);
+
+  const start = async () => {
+    setState({ busy: true, stage: "starting" });
+    try {
+      const d = await api<any>("/runs", { method: "POST" });
+      setState({ busy: true, stage: `run #${d.run_id} · fetching` });
+    } catch (e) {
+      setState({ busy: false, error: (e as Error).message });
+    }
+  };
+
+  return (
+    <div className="run-now">
+      <button className="btn" onClick={start} disabled={state.busy}>
+        {state.busy ? `Running… ${state.stage ?? ""}` : "Run now"}
+      </button>
+      {state.error && <span className="run-now-error">{state.error}</span>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 function Overview() {
-  const { data, error } = useData<any>("/overview");
+  const { data, error, reload } = useData<any>("/overview");
   if (error) return <ErrorBox message={error} />;
   if (!data) return <Loading />;
   const { kpis, status, ai_spend } = data;
   return (
     <>
       <header className="page-head">
-        <h1>Overview</h1>
-        <p className="sub">Remote & Nepal-eligible opportunities matched against your CV.</p>
+        <div>
+          <h1>Overview</h1>
+          <p className="sub">Remote & Nepal-eligible opportunities matched against your CV.</p>
+        </div>
+        <RunNowButton onDone={reload} />
       </header>
       {status.warnings.length > 0 && (
         <div className="notice warn">

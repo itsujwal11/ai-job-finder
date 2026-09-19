@@ -162,6 +162,8 @@ def ats_links(html_text: str, limit: int = 20) -> list[DiscoveredLink]:
 
 def fetch_page(task: dict[str, Any], ctx: TaskContext) -> TaskResult:
     url = task["url"]
+    # Pages queued from a named job board keep that board's name (see services.ingest.store_link).
+    source = task.get("source") or "web"
     
     domain = urlsplit(url).hostname or ""
     jina_domains = ctx.cfg.terms("http.jina_domains")
@@ -180,6 +182,7 @@ def fetch_page(task: dict[str, Any], ctx: TaskContext) -> TaskResult:
         job = ctx.extractor(url, text)
         if job is None:
             return TaskResult(status="skipped", http_status=response.status, note="AI extraction: not a job posting")
+        job.source = source
         return TaskResult(http_status=response.status, jobs=[job], note="AI-extracted via Jina Reader")
 
     response = ctx.client.get(
@@ -193,7 +196,7 @@ def fetch_page(task: dict[str, Any], ctx: TaskContext) -> TaskResult:
     links = ats_links(response.text)
     postings = extract_jsonld_postings(response.text)
     if postings:
-        jobs = [jsonld_to_job(p, response.url, source="web") for p in postings[:5]]
+        jobs = [jsonld_to_job(p, response.url, source=source) for p in postings[:5]]
         return TaskResult(http_status=response.status, jobs=[j for j in jobs if j.title], links=links, note="JSON-LD JobPosting")
 
     text = main_text(response.text)
@@ -204,6 +207,7 @@ def fetch_page(task: dict[str, Any], ctx: TaskContext) -> TaskResult:
     job = ctx.extractor(response.url, text)
     if job is None:
         return TaskResult(status="skipped", http_status=response.status, links=links, note="AI extraction: not a job posting")
+    job.source = source
     return TaskResult(http_status=response.status, jobs=[job], links=links, note="AI-extracted")
 
 

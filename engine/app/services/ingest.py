@@ -10,8 +10,9 @@ from ..config import Config
 from ..models import DiscoveredLink, NormalizedJob
 from ..pipeline.dedup import canonicalize_url, find_duplicate_posting, fingerprint, url_hash
 from ..pipeline.normalize import host_matches, host_of, norm_company, norm_title, parse_salary_text, to_npr_monthly
+from ..pipeline.prescore import prescore
 from ..sources.ats import detect_ats_board
-from .tasks import PRIORITY, board_url, enqueue_within_caps
+from .tasks import PRIORITY, board_url, enqueue_within_caps, page_source
 
 _NON_HTML = re.compile(r"\.(pdf|docx?|pptx?|xlsx?|png|jpe?g|gif|zip|mp4)(\?|$)", re.IGNORECASE)
 
@@ -60,6 +61,16 @@ def store_job(conn: psycopg.Connection, job: NormalizedJob, run_id: int, cfg: Co
     raw = dict(job.raw)
     raw.update({"tags": job.tags, "salary_text": job.salary_text})
 
+    # Cheap ordering signal so the scarce AI analysis slots go to the most promising postings.
+    rank, rank_reasons = prescore(
+        {
+            "title": job.title, "description": job.description, "remote_type": job.remote_type,
+            "location_text": job.location_text, "source": job.source,
+            "salary_npr_monthly_min": npr_min, "salary_npr_monthly_max": npr_max,
+        },
+        cfg,
+    )
+
     row = db.fetch_one(
         """
         INSERT INTO opportunities (
@@ -67,8 +78,8 @@ def store_job(conn: psycopg.Connection, job: NormalizedJob, run_id: int, cfg: Co
             duplicate_of, title, title_norm, company_name, company_norm, company_website, location_text,
             location_restrictions, remote_type, employment_type, salary_min, salary_max, salary_currency, salary_period,
             salary_npr_monthly_min, salary_npr_monthly_max, description, description_quality, apply_url, apply_email,
-            posted_at, expires_at, raw, pipeline_status
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            posted_at, expires_at, raw, pipeline_status, prescore, prescore_reasons
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         RETURNING id
         """,
@@ -78,6 +89,7 @@ def store_job(conn: psycopg.Connection, job: NormalizedJob, run_id: int, cfg: Co
             job.location_restrictions, job.remote_type, job.employment_type, salary_min, salary_max, currency, period,
             npr_min, npr_max, job.description, job.description_quality, job.apply_url, job.apply_email,
             job.posted_at, job.expires_at, db.jsonb(raw), "duplicate" if duplicate_of else "new",
+            rank, db.jsonb(rank_reasons),
         ),
         conn,
     )
@@ -139,6 +151,7 @@ def store_link(conn: psycopg.Connection, link: DiscoveredLink, run_id: int, cfg:
     if inserted is None:
         return "url_known"
     label = f"{host_of(url)}{('/' + url.split('/', 3)[3])[:80] if url.count('/') >= 3 else ''}"
-    if enqueue_within_caps(conn, cfg, run_id, "page", "web", label, url, {"title_hint": link.title}, PRIORITY["page"]):
+    if enqueue_within_caps(conn, cfg, run_id, "page", page_source(link.via), label, url,
+                           {"title_hint": link.title}, PRIORITY["page"]):
         return "page_queued"
     return "page_deferred"

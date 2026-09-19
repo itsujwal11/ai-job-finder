@@ -18,6 +18,7 @@ from ..pipeline.dedup import find_prior_application
 from ..pipeline.legitimacy import CURATED_SOURCES, LegitimacyResult, combine_legitimacy, heuristic_legitimacy
 from ..pipeline.normalize import ascii_lower, contains_term, host_matches, host_of, registrable_domain
 from ..pipeline.policy import blocking_reasons, decide
+from ..pipeline.prescore import prescore
 from ..pipeline.rules import (
     EligibilityResult,
     SeniorityResult,
@@ -26,6 +27,7 @@ from ..pipeline.rules import (
     assess_seniority,
     combine_eligibility,
     detect_apply_method,
+    is_nepal_local,
     staleness_reason,
 )
 from ..pipeline.scoring import ELIGIBILITY_POINTS, compensation_points, compute_match_score
@@ -70,6 +72,7 @@ def process_next(run_id: int, max_items: int = 6, max_seconds: int = 240) -> dic
     cfg, env, profile = load_config(), get_env(), load_profile()
     db.execute("UPDATE runs SET stage = 'processing' WHERE id = %s AND stage = 'fetching'", (run_id,))
     _reset_stale()
+    _backfill_prescores(cfg)
 
     ai, ai_note = _ai_service(cfg, env, profile)
     analysis_cap = int(cfg.get("pipeline.max_ai_analyses_per_run", 40))
@@ -119,6 +122,10 @@ def _ai_service(cfg: Config, env: Env, profile: CandidateProfile) -> tuple[Claud
     try:
         service = create_ai_service(cfg, env, profile)
         service.ensure_budget()
+        # An openai_compatible service knows which of its models still have quota today.
+        available = getattr(service, "available_models", None)
+        if available is not None and not available():
+            return None, "Every configured AI model is out of quota for today - retrying on the next run"
         return service, None
     except (AIUnavailable, BudgetExceeded) as exc:
         return None, str(exc)
@@ -127,6 +134,32 @@ def _ai_service(cfg: Config, env: Env, profile: CandidateProfile) -> tuple[Claud
 def _ai_count(run_id: int, purpose: str, distinct: bool = False) -> int:
     expr = "count(DISTINCT opportunity_id)" if distinct else "count(*)"
     return int(db.fetch_value(f"SELECT {expr} AS n FROM ai_usage WHERE run_id = %s AND purpose = %s", (run_id, purpose)) or 0)
+
+
+def _backfill_prescores(cfg: Config, limit: int = 400) -> int:
+    """Give rows stored before pre-scoring existed a rank, so the backlog orders correctly.
+
+    Runs at the start of every process batch and stops doing work once the table is caught up.
+    """
+    rows = db.fetch_all(
+        """
+        SELECT id, title, description, remote_type, location_text, source, nepal_eligibility,
+               salary_npr_monthly_min, salary_npr_monthly_max
+        FROM opportunities
+        WHERE prescore IS NULL AND pipeline_status IN ('new', 'awaiting_ai', 'analysis_failed')
+        ORDER BY first_seen_at DESC LIMIT %s
+        """,
+        (limit,),
+    )
+    for row in rows:
+        rank, reasons = prescore(row, cfg, eligibility_status=row["nepal_eligibility"])
+        db.execute(
+            "UPDATE opportunities SET prescore = %s, prescore_reasons = %s WHERE id = %s",
+            (rank, db.jsonb(reasons), row["id"]),
+        )
+    if rows:
+        log.info("Backfilled pre-scores for %s opportunities", len(rows))
+    return len(rows)
 
 
 def _reset_stale() -> None:
@@ -147,7 +180,7 @@ def _claim(run_id: int, limit: int, include_retry: bool) -> list[dict[str, Any]]
         UPDATE opportunities SET pipeline_status = 'processing', updated_at = now()
         WHERE id IN (
             SELECT id FROM opportunities WHERE {_CLAIMABLE}
-            ORDER BY (pipeline_status = 'new') DESC, posted_at DESC NULLS LAST, first_seen_at DESC
+            ORDER BY COALESCE(prescore, 40) DESC, posted_at DESC NULLS LAST, first_seen_at DESC
             LIMIT %(limit)s FOR UPDATE SKIP LOCKED
         )
         RETURNING *
@@ -183,7 +216,10 @@ def _apply_rules(row: dict[str, Any], ctx: TaskContext, run_id: int) -> RuleStat
     stale = staleness_reason(row["posted_at"], row["expires_at"], int(cfg.get("pipeline.max_posting_age_days", 30)))
     if stale:
         return _filter(row, run_id, [stale], None, {})
-    relevant, relevance_reason = assess_relevance(row["title"], row["description"] or "", cfg)
+    nepal_local = is_nepal_local(row["location_text"], row["source"], cfg)
+    relevant, relevance_reason = assess_relevance(
+        row["title"], row["description"] or "", cfg, nepal_local=nepal_local
+    )
     if not relevant:
         return _filter(row, run_id, [relevance_reason], None, {})
 
@@ -204,6 +240,7 @@ def _apply_rules(row: dict[str, Any], ctx: TaskContext, run_id: int) -> RuleStat
     )
     signals: dict[str, Any] = {
         "relevance": relevance_reason,
+        "nepal_local_market": nepal_local,
         "seniority": {"blocked": seniority.blocked, "reasons": seniority.reasons, "required_years": seniority.required_years},
         "nepal_eligibility_rule": {"status": eligibility.status, "evidence": eligibility.evidence, "explicit": eligibility.explicit},
     }

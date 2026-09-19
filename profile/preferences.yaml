@@ -13,9 +13,9 @@ candidate:
   # The CV shows the labels "LinkedIn | Portfolio | GitHub" without URLs.
   # Fill these in; empty links are never added to generated materials.
   links:
-    linkedin: ""
-    portfolio: ""
-    github: ""
+    linkedin: "https://www.linkedin.com/in/ujwol-shrestha-374757199/"
+    portfolio: "https://shresthaujwol.com.np"
+    github: "https://github.com/itsujwal11"
   contact_email: ujwolstha712@gmail.com
 
 targets:

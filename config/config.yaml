@@ -28,8 +28,8 @@ applications:
 # -----------------------------------------------------------------------------
 pipeline:
   max_posting_age_days: 30
-  max_tasks_per_run: 200
-  max_pages_per_run: 90             # web pages from search, AI discovery and local job boards
+  max_tasks_per_run: 320
+  max_pages_per_run: 170            # web pages from search, AI discovery and local job boards
   # Share of that budget given to pages left over from earlier runs. The rest stays free for
   # links found during this run, so a backlog can never starve the local job boards.
   pending_pages_share: 0.5
@@ -61,7 +61,7 @@ ai:
     materials: high
     verify: medium
   use_refusal_fallbacks: true       # server-side fallbacks="default" (Opus 5 / Fable 5.x only)
-  daily_budget_usd: 0.50            # hard stop for all AI calls per Asia/Kathmandu day
+  daily_budget_usd: 0.00            # free tier costs $0; set higher if using a paid key
   # Free API tiers reject bursts with HTTP 429 long before the daily quota is gone, so the
   # engine paces itself. Gemini free tier is 10 RPM; raise this if you move to a paid key.
   max_requests_per_minute: 8
@@ -75,9 +75,23 @@ ai:
   model_fallbacks:
     - gemini-2.5-flash-lite
     - gemini-2.5-flash
-  web_discovery:
-    enabled: false                  # Claude web search costs extra ($10 / 1000 searches) - off for low cost
-    max_searches_per_run: 8
+  # Extra providers tried after the ones above, in order. A provider whose api_key_env is not
+  # set in .env is skipped silently, so you can leave them all listed.
+  #
+  # Why this exists: free tiers meter per provider AND per model. Both free Gemini models allow
+  # only 20 requests per day each, which one run uses up. Adding a second provider is what makes
+  # the daily run finish. Groq's free tier is the most generous of these.
+  providers:
+    - name: groq
+      enabled: true
+      base_url: https://api.groq.com/openai/v1
+      api_key_env: GROQ_API_KEY            # free key: https://console.groq.com/keys
+      models: [llama-3.3-70b-versatile, llama-3.1-8b-instant]
+    - name: openrouter
+      enabled: true
+      base_url: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY      # free key: https://openrouter.ai/keys
+      models: [meta-llama/llama-3.3-70b-instruct:free, google/gemma-3-27b-it:free]
   # USD per million tokens - used for the budget guard. Update if prices change.
   pricing:
     claude-opus-5:     { input: 5.00,  output: 25.00 }
@@ -141,23 +155,20 @@ sources:
       - https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss
       - https://weworkremotely.com/categories/remote-customer-support-jobs.rss
   workingnomads:   { enabled: true,  url: "https://www.workingnomads.com/api/exposed_jobs/" }
-  arbeitnow:       { enabled: false, url: "https://www.arbeitnow.com/api/job-board-api" }   # mostly Germany-restricted
+  # Mostly Germany-restricted, but it carries worldwide-remote listings too and the eligibility
+  # rules drop the rest for free.
+  arbeitnow:       { enabled: true,  url: "https://www.arbeitnow.com/api/job-board-api" }
   hackernews:      { enabled: true,  threads: [who_is_hiring, freelancer] }
-  # Ojiiz (ojiiz.com) - public listing API, no key needed. Categories are the site's own names;
-  # drop or add entries to change what is pulled. Company names sit behind their paid unlock,
-  # so these arrive without a company and are worth opening on the site itself.
-  ojiiz:
+  # The Muse: no key needed. Paging is 1-based and `category`/`level` can be repeated.
+  themuse:
     enabled: true
-    url: "https://api.ojiiz.com/api/jobs"
-    page_size: 100
-    pages: 1
-    categories:
-      - "Web Development"
-      - "UI/UX Designer"
-      - "DevOps/Database"
-      - "AI/ML/Computer Vision"
-      - "Customer Support"
-      - "CMS"
+    url: "https://www.themuse.com/api/public/jobs"
+    pages: 4
+    categories: ["Software Engineering", "IT", "Design and UX"]
+    levels: ["Entry Level", "Internship"]
+  # Needs a free key from https://findwork.dev/developers/ - set FINDWORK_API_KEY in .env.
+  # Without it the task is skipped, not failed.
+  findwork:        { enabled: true,  url: "https://findwork.dev/api/jobs/", search: "javascript" }
 
 # -----------------------------------------------------------------------------
 # Nepali job boards. None has an API, but every detail page carries a schema.org
@@ -167,7 +178,7 @@ sources:
 local_boards:
   # Postings from these sources are treated as "Nepal local market": the stack exclusions in
   # relevance.nepal_relaxed_exclude_terms do not apply to them.
-  sources: [merojob, froxjob, jobaxle, ojiiz]
+  sources: [merojob, froxjob, jobaxle, kumarijob, jobsnepal, merorojgari]
   boards:
     - name: merojob
       label: "merojob.com"
@@ -185,8 +196,26 @@ local_boards:
       label: "jobaxle.com"
       enabled: true
       sitemap: "https://jobaxle.com/sitemap.xml"
-      job_url_pattern: "/jobs/"          # its sitemap has no lastmod; newest entries are last
+      job_url_pattern: "/jobs/"
       max_urls: 25
+    - name: kumarijob
+      label: "kumarijob.com"
+      enabled: true
+      sitemap: "https://www.kumarijob.com/sitemap.xml"
+      sitemap_pattern: "sitemap-jobs"
+      max_urls: 30
+    - name: jobsnepal
+      label: "jobsnepal.com"
+      enabled: true
+      sitemap: "https://www.jobsnepal.com/sitemap.xml"
+      sitemap_pattern: "jobs-sitemap"
+      max_urls: 30
+    - name: merorojgari
+      label: "merorojgari.com"
+      enabled: true
+      sitemap: "https://merorojgari.com/sitemap.xml"
+      sitemap_pattern: "job_listing-sitemap"
+      max_urls: 30
 
 ats:
   auto_discover: true
@@ -199,11 +228,13 @@ ats:
 
 search:
   # Providers are used only when their API key is set in .env.
+  # Tavily gives 1000 free searches/month — this is your main "entire internet" source.
   providers: [brave, tavily, google_cse]
-  max_queries_per_run: 12
+  max_queries_per_run: 20
   results_per_query: 10
-  freshness_days: 7
+  freshness_days: 14
   queries:
+    # --- Core remote job searches ---
     - '"junior frontend developer" remote worldwide'
     - '"react developer" remote "anywhere in the world" junior'
     - '"frontend intern" remote worldwide'
@@ -211,13 +242,33 @@ search:
     - 'remote "web developer" junior "work from anywhere"'
     - 'junior "full stack developer" remote APAC'
     - 'remote frontend developer Nepal'
+    # --- ATS board searches ---
     - 'site:jobs.lever.co remote junior frontend'
     - 'site:boards.greenhouse.io remote junior react'
     - 'site:jobs.ashbyhq.com remote junior engineer'
+    # --- Role-specific searches ---
     - '"technical support" remote worldwide entry level software'
     - '"QA automation" junior remote worldwide'
     - '"junior devops" OR "cloud intern" remote worldwide'
     - 'part-time remote react developer contract'
+    # --- Broader internet searches ---
+    - '"Next.js developer" remote entry level 2026'
+    - '"TypeScript developer" remote junior hiring now'
+    - 'junior software engineer remote "work from anywhere" hiring'
+    - 'remote developer jobs Nepal eligible worldwide 2026'
+    - '"entry level" "software engineer" remote global hiring'
+    - 'junior react developer remote startup hiring'
+    - 'remote web developer internship worldwide'
+    - 'site:angel.co remote junior frontend developer'
+    - 'site:wellfound.com remote junior software engineer'
+    - 'remote "application support" OR "technical support" engineer entry level'
+    # --- Kathmandu / Nepal local market ---
+    - '"frontend developer" job vacancy Kathmandu Nepal'
+    - '"react developer" OR "javascript developer" vacancy Nepal'
+    - '"software developer" job vacancy Kathmandu apply'
+    - 'IT internship OR "junior developer" vacancy Kathmandu Nepal'
+    - '"QA engineer" OR "quality assurance" job vacancy Kathmandu'
+    - 'remote developer job hiring from Nepal "South Asia"'
 
 # -----------------------------------------------------------------------------
 # Deterministic filters (run before any AI call - they cost nothing)
@@ -313,6 +364,26 @@ relevance:
     - network engineer
     - software trainee
     - associate software
+    # Common entry-level Nepali IT titles that do not appear on worldwide boards.
+    - it support
+    - it technician
+    - computer operator
+    - technical officer
+    - software officer
+    - web designer
+    - junior php
+    - backend developer
+    - python developer
+    - django
+    - node js
+    - nodejs developer
+    - erp
+    - odoo
+    - database administrator
+    - game programmer
+    - game developer
+    - software intern
+    - trainee engineer
 
 seniority:
   blocked_title_terms: [senior, sr, staff, principal, lead, head of, director, architect, manager, vp, vice president, chief, expert, "engineer iii", "engineer iv"]

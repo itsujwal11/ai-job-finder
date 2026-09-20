@@ -1,8 +1,8 @@
-"""Nepali boards, the Ojiiz API adapter and the rule-based pre-score."""
+"""Nepali boards and the rule-based pre-score."""
 from app.pipeline.prescore import prescore
 from app.pipeline.rules import assess_relevance, is_nepal_local
 from app.services.tasks import page_source
-from app.sources import local_boards, ojiiz
+from app.sources import free_apis, local_boards
 
 SITEMAP_INDEX = """<?xml version="1.0"?>
 <sitemapindex><sitemap><loc>https://board.test/sitemap-job_post-1.xml</loc></sitemap>
@@ -62,39 +62,6 @@ def test_local_board_ignores_unmatched_child_sitemaps(make_ctx):
     assert not any("blog" in url for url in ctx.client.requested)
 
 
-OJIIZ_PAGE = {
-    "success": True,
-    "data": {
-        "data": [
-            {"_id": "abc123", "jobTitle": "Junior React Developer", "jobHeading": "Individual Hiring",
-             "jobDetail": "<p>Build UIs with React</p>", "jobPricing": "$2,000 - $3,000 USD",
-             "jobCategory": "Web Development", "jobType": "job", "jobDate": "2026-09-19T05:12:54.014Z",
-             "isOpen": True, "tags": ["Fixed Cost"]},
-            {"_id": "closed1", "jobTitle": "Closed Role", "isOpen": False, "jobCategory": "Web Development"},
-        ],
-        "pagination": {"page": 1, "limit": 100, "total": 2, "totalPages": 1},
-    },
-}
-
-
-def test_ojiiz_adapter(make_ctx):
-    ctx = make_ctx([("api.ojiiz.com/api/jobs", OJIIZ_PAGE, "application/json")])
-    result = ojiiz.fetch_ojiiz(
-        {"url": "https://api.ojiiz.com/api/jobs", "source": "ojiiz",
-         "params": {"categories": ["Web Development"], "pages": 1, "page_size": 100}},
-        ctx,
-    )
-    assert len(result.jobs) == 1, "closed postings are dropped"
-    job = result.jobs[0]
-    assert job.source == "ojiiz"
-    assert job.source_external_id == "abc123"
-    assert job.source_url.endswith("/abc123")
-    assert job.company_name is None, "company sits behind the paid unlock and is never scraped"
-    assert "Build UIs with React" in job.description
-    assert job.salary_text == "$2,000 - $3,000 USD"
-    assert job.posted_at is not None
-
-
 def test_nepal_local_relaxes_stack_exclusions(cfg):
     """A PHP role is noise worldwide but normal in Kathmandu."""
     assert assess_relevance("PHP Laravel Developer", "", cfg)[0] is False
@@ -132,3 +99,62 @@ def test_page_source_keeps_board_attribution():
     assert page_source("local_board:merojob") == "merojob"
     assert page_source("search:tavily") == "web"
     assert page_source(None) == "web"
+
+
+MUSE_PAGE = {
+    "page": 1,
+    "page_count": 1,
+    "results": [
+        {
+            "id": 111, "name": "Junior Frontend Engineer", "type": "external",
+            "contents": "<p>Build UIs with React</p>", "publication_date": "2026-09-18T10:00:00Z",
+            "company": {"name": "Acme"},
+            "locations": [{"name": "Flexible / Remote"}],
+            "levels": [{"name": "Entry Level"}],
+            "categories": [{"name": "Software Engineering"}],
+            "refs": {"landing_page": "https://www.themuse.com/jobs/acme/junior-frontend-engineer"},
+        },
+        {"id": 112, "name": "No Landing Page", "refs": {}},
+    ],
+}
+
+
+def test_themuse_uses_one_based_paging(make_ctx):
+    """page=0 returns nothing from this API, so the first request must ask for page 1."""
+    ctx = make_ctx([("themuse.com/api/public/jobs", MUSE_PAGE, "application/json")])
+    result = free_apis.fetch_themuse(
+        {"url": "https://www.themuse.com/api/public/jobs", "source": "themuse",
+         "params": {"pages": 3, "categories": ["Software Engineering"], "levels": ["Entry Level"]}},
+        ctx,
+    )
+    assert "page=1" in ctx.client.requested[0]
+    assert "page=0" not in ctx.client.requested[0]
+    assert len(result.jobs) == 1, "a posting without a landing page is skipped"
+    job = result.jobs[0]
+    assert job.source == "themuse"
+    assert job.remote_type == "remote"
+    assert job.raw["seniority_hint"] == "Entry Level"
+    # page_count is 1, so it must not keep requesting further pages.
+    assert len(ctx.client.requested) == 1
+
+
+def test_themuse_repeats_category_and_level_params(make_ctx):
+    ctx = make_ctx([("themuse.com/api/public/jobs", MUSE_PAGE, "application/json")])
+    free_apis.fetch_themuse(
+        {"url": "https://www.themuse.com/api/public/jobs", "source": "themuse",
+         "params": {"pages": 1, "categories": ["Software Engineering", "IT"], "levels": ["Entry Level"]}},
+        ctx,
+    )
+    url = ctx.client.requested[0]
+    assert url.count("category=") == 2
+    assert "level=Entry+Level" in url or "level=Entry%20Level" in url
+
+
+def test_findwork_skips_without_a_key(make_ctx, monkeypatch):
+    """No key must be a visible skip, not a silent empty result or a failed run."""
+    monkeypatch.delenv("FINDWORK_API_KEY", raising=False)
+    ctx = make_ctx([])
+    result = free_apis.fetch_findwork({"url": "https://findwork.dev/api/jobs/", "source": "findwork"}, ctx)
+    assert result.status == "skipped"
+    assert "FINDWORK_API_KEY" in (result.note or "")
+    assert ctx.client.requested == [], "no request is made without a key"

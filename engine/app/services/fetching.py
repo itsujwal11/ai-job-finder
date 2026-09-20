@@ -129,7 +129,10 @@ def _store_result(task: dict[str, Any], result: TaskResult, cfg: Config, run_id:
         db.execute(
             "UPDATE fetch_tasks SET status = %s, http_status = %s, items_found = %s, items_new = %s, error = %s, finished_at = now()"
             " WHERE id = %s",
-            (result.status, result.http_status, counts["found"], counts.get("new", 0), result.error or result.note, task["id"]),
+            # Link-only sources (search, local boards) report the links they produced, so a task
+            # that found 30 job URLs does not read as "found 0".
+            (result.status, result.http_status, counts["found"] or counts["links"],
+             counts.get("new", 0) or counts.get("page_queued", 0), result.error or result.note, task["id"]),
             conn,
         )
         if task["kind"] == "ats_board":

@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from typing import Any, TypeVar
@@ -145,6 +147,8 @@ class ClaudeService:
 
     def ensure_budget(self) -> None:
         budget = float(self.cfg.get("ai.daily_budget_usd", 3.0))
+        if budget <= 0:
+            return  # budget guard disabled (free tier)
         spent = self.spent_today_usd()
         if spent >= budget:
             raise BudgetExceeded(f"Daily AI budget reached (${spent:.2f} of ${budget:.2f})")
@@ -377,6 +381,61 @@ class ClaudeService:
         return leads
 
 
+@dataclass(frozen=True)
+class Endpoint:
+    """One concrete place a request can be sent: a provider's URL, key and model.
+
+    Free tiers meter per provider *and* per model, so the fallback chain is a list of these
+    rather than a list of model names against one base URL. A provider whose key env var is
+    empty never makes it into the chain.
+    """
+
+    provider: str
+    url: str
+    api_key: str | None
+    model: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}:{self.model}"
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+
+def build_endpoints(cfg: Config, env: Env) -> list[Endpoint]:
+    """Chain from config `ai.providers`, preceded by whatever .env points at.
+
+    .env stays authoritative for the primary provider so an existing setup keeps working; the
+    config list only adds places to fall back to.
+    """
+    endpoints: list[Endpoint] = []
+
+    def add(provider: str, base_url: str | None, api_key: str | None, models: list[str]) -> None:
+        if not base_url:
+            return
+        url = base_url.rstrip("/") + "/chat/completions"
+        for model in models:
+            if model and not any(e.provider == provider and e.model == model for e in endpoints):
+                endpoints.append(Endpoint(provider, url, api_key, str(model)))
+
+    if env.openai_base_url and env.openai_model:
+        add("env", env.openai_base_url, env.openai_api_key,
+            [env.openai_model] + [str(m) for m in (cfg.get("ai.model_fallbacks") or [])])
+
+    for spec in cfg.get("ai.providers") or []:
+        if not spec.get("enabled", True):
+            continue
+        api_key = os.environ.get(str(spec.get("api_key_env") or ""), "").strip() or None
+        if spec.get("api_key_env") and not api_key:
+            log.info("AI provider %s skipped: %s is not set", spec.get("name"), spec.get("api_key_env"))
+            continue
+        add(str(spec.get("name") or "provider"), spec.get("base_url"), api_key,
+            [str(m) for m in (spec.get("models") or [])])
+    return endpoints
+
+
 class OpenAICompatibleService(ClaudeService):
     """Any OpenAI-compatible chat API (OmniRoute, OpenRouter, Ollama, LM Studio, ...).
 
@@ -385,22 +444,24 @@ class OpenAICompatibleService(ClaudeService):
     """
 
     def __init__(self, cfg: Config, env: Env, profile: CandidateProfile):
-        if not (env.openai_base_url and env.openai_model):
-            raise AIUnavailable("AI_PROVIDER=openai_compatible needs OPENAI_BASE_URL and OPENAI_MODEL in .env")
         self.cfg = cfg
         self.env = env
         self.profile = profile
-        self.model = env.openai_model
-        # Free tiers are metered per model, so a chain lets the run continue on the next model
-        # instead of stopping the moment the primary one runs out for the day.
-        self.models: list[str] = list(dict.fromkeys(
-            [env.openai_model] + [str(m) for m in (cfg.get("ai.model_fallbacks") or [])]
-        ))
-        self.url = env.openai_base_url.rstrip("/") + "/chat/completions"
-        headers = {"Authorization": f"Bearer {env.openai_api_key}"} if env.openai_api_key else {}
-        self.http = httpx.Client(timeout=300, headers=headers)
+        self.endpoints = build_endpoints(cfg, env)
+        if not self.endpoints:
+            raise AIUnavailable(
+                "No AI endpoint is configured. Set OPENAI_BASE_URL / OPENAI_MODEL in .env, or give "
+                "ai.providers in config/config.yaml a provider whose API key env var is set."
+            )
+        self.model = self.endpoints[0].model
+        self.http = httpx.Client(timeout=300)
         self.limiter = RateLimiter(float(cfg.get("ai.max_requests_per_minute", 10) or 0))
         self.max_retries = int(cfg.get("ai.max_retries", 4))
+
+    @property
+    def models(self) -> list[str]:
+        """Model names in the chain, for logs and the quota command."""
+        return [e.model for e in self.endpoints]
 
     def _record_openai(self, purpose: str, data: dict[str, Any], run_id: int | None, opportunity_id: int | None, ok: bool) -> None:
         usage = data.get("usage") or {}
@@ -444,70 +505,75 @@ class OpenAICompatibleService(ClaudeService):
     def _today(self) -> date:
         return datetime.now(ZoneInfo(str(self.cfg.get("timezone", "UTC")))).date()
 
-    def available_models(self) -> list[str]:
+    def available_endpoints(self) -> list[Endpoint]:
         today = self._today()
-        return [m for m in self.models if _exhausted_today.get(m) != today]
+        return [e for e in self.endpoints if _exhausted_today.get(e.key) != today]
+
+    def available_models(self) -> list[str]:
+        return [e.model for e in self.available_endpoints()]
 
     def _post(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Send one chat completion, walking down the model chain past exhausted models."""
-        models = self.available_models()
-        if not models:
+        """Send one chat completion, walking the chain past anything spent for today."""
+        endpoints = self.available_endpoints()
+        if not endpoints:
             raise AIUnavailable(
-                f"Every configured model is out of quota for today ({', '.join(self.models)}). "
-                "Add another model to ai.model_fallbacks, or switch to a paid key."
+                "Every configured AI model is out of quota for today "
+                f"({', '.join(e.key for e in self.endpoints)}). Add a provider under ai.providers "
+                "in config/config.yaml, or switch to a paid key."
             )
         last_error = ""
-        for model in models:
+        for endpoint in endpoints:
             try:
-                data = self._post_one({**body, "model": model})
+                data = self._post_one({**body, "model": endpoint.model}, endpoint)
             except _QuotaExhausted as exc:
-                _exhausted_today[model] = self._today()
+                _exhausted_today[endpoint.key] = self._today()
                 last_error = str(exc)
-                log.warning("Model %s is out of quota for today - falling back to the next model", model)
+                remaining = len(self.available_endpoints())
+                log.warning("%s is spent for today (%s); %s endpoint(s) left", endpoint.key, exc, remaining)
                 continue
-            self.model = model          # what actually answered, for usage records and the dashboard
+            self.model = endpoint.model   # what actually answered, for usage records and the UI
             return data
-        raise AIUnavailable(f"All models are out of quota for today. Last error: {last_error[:300]}")
+        raise AIUnavailable(f"All AI endpoints are out of quota for today. Last error: {last_error[:300]}")
 
-    def _post_one(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _post_one(self, body: dict[str, Any], endpoint: Endpoint) -> dict[str, Any]:
         last_status, last_text = 0, ""
         for attempt in range(self.max_retries + 1):
             self.limiter.acquire()
             try:
-                response = self.http.post(self.url, json=body)
+                response = self.http.post(endpoint.url, json=body, headers=endpoint.headers)
                 if response.status_code == 400 and "response_format" in body:
                     # Some providers reject json_object mode; drop it and rely on the prompt.
                     body = {k: v for k, v in body.items() if k != "response_format"}
                     self.limiter.acquire()
-                    response = self.http.post(self.url, json=body)
+                    response = self.http.post(endpoint.url, json=body, headers=endpoint.headers)
             except httpx.HTTPError as exc:
                 if attempt < self.max_retries:
                     time.sleep(min(30.0, 2.0 ** attempt))
                     continue
-                raise AIError(f"Could not reach AI API at {self.url}: {type(exc).__name__}") from exc
+                raise AIError(f"Could not reach {endpoint.provider} at {endpoint.url}: {type(exc).__name__}") from exc
 
             if response.status_code in (401, 403):
-                raise AIUnavailable(f"AI API rejected the key (HTTP {response.status_code})")
+                # One provider's bad key must not stop the others.
+                raise _QuotaExhausted(f"{endpoint.provider} rejected the key (HTTP {response.status_code})")
             if response.status_code == 404:
-                raise _QuotaExhausted(f"Model {body.get('model')} is not available on this key (HTTP 404)")
+                raise _QuotaExhausted(f"{endpoint.key} is not available on this key (HTTP 404)")
             if response.status_code in RETRYABLE_STATUS:
                 last_status, last_text = response.status_code, response.text[:400]
-                # A daily quota will not clear by waiting, so stop and let the caller try another model.
+                # A daily quota will not clear by waiting, so move on to the next endpoint.
                 if response.status_code == 429 and self._is_daily_quota(response.text):
-                    raise _QuotaExhausted(f"Daily quota exhausted for {body.get('model')}")
+                    raise _QuotaExhausted(f"daily quota exhausted (HTTP 429)")
                 if attempt < self.max_retries:
                     delay = self._retry_after_seconds(response, attempt)
                     self.limiter.pause_until(delay)
-                    log.info("AI API busy (HTTP %s) - retrying in %.1fs (attempt %s/%s)",
-                             last_status, delay, attempt + 1, self.max_retries)
+                    log.info("%s busy (HTTP %s) - retrying in %.1fs (attempt %s/%s)",
+                             endpoint.key, last_status, delay, attempt + 1, self.max_retries)
                     time.sleep(delay)
                     continue
-                raise _QuotaExhausted(f"{body.get('model')} still returning HTTP {last_status} after "
-                                      f"{self.max_retries} retries: {last_text}")
+                raise _QuotaExhausted(f"still HTTP {last_status} after {self.max_retries} retries: {last_text}")
             if response.status_code >= 400:
-                raise AIError(f"AI API error {response.status_code}: {response.text[:300]}")
+                raise AIError(f"{endpoint.provider} error {response.status_code}: {response.text[:300]}")
             return response.json()
-        raise AIError(f"AI API error {last_status}: {last_text}")
+        raise AIError(f"{endpoint.provider} error {last_status}: {last_text}")
 
     def _parse(self, *, purpose: str, prompt: str, user_content: str, output_model: type[T],
                effort_key: str, run_id: int | None, opportunity_id: int | None) -> T:

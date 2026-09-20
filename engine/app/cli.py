@@ -58,41 +58,49 @@ def cmd_check(_: argparse.Namespace) -> int:
 
 
 def cmd_quota(_: argparse.Namespace) -> int:
-    """Ask each configured model for a one-token reply and report what its quota says."""
+    """Ask every endpoint in the fallback chain for a one-token reply and report its quota."""
     import re
 
     import httpx
 
-    env = get_env()
-    cfg = load_config()
+    from .ai import build_endpoints
+
+    env, cfg = get_env(), load_config()
     if env.ai_provider != "openai_compatible":
         print("[info] quota probing only applies to AI_PROVIDER=openai_compatible")
         return 0
-    models = list(dict.fromkeys([env.openai_model] + [str(m) for m in (cfg.get("ai.model_fallbacks") or [])]))
-    url = (env.openai_base_url or "").rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {env.openai_api_key}"} if env.openai_api_key else {}
+    endpoints = build_endpoints(cfg, env)
+    if not endpoints:
+        print("[FAIL] no AI endpoint configured - set OPENAI_BASE_URL / OPENAI_MODEL in .env")
+        return 1
+
     usable = 0
-    for model in models:
-        body = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
+    for endpoint in endpoints:
+        body = {"model": endpoint.model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
         try:
-            response = httpx.post(url, json=body, headers=headers, timeout=60)
+            response = httpx.post(endpoint.url, json=body, headers=endpoint.headers, timeout=60)
         except httpx.HTTPError as exc:
-            print(f"[FAIL] {model:24} unreachable: {type(exc).__name__}")
+            print(f"[FAIL] {endpoint.key:52} unreachable: {type(exc).__name__}")
             continue
         if response.status_code == 200:
             usable += 1
-            print(f"[ok]   {model:24} quota available")
+            print(f"[ok]   {endpoint.key:52} quota available")
         elif response.status_code == 429:
             quota = re.search(r'"quotaId":\s*"([^"]+)".*?"quotaValue":\s*"(\d+)"', response.text, re.S)
             detail = f"{quota.group(1)} = {quota.group(2)}" if quota else "rate limited"
-            print(f"[warn] {model:24} out of quota ({detail})")
+            print(f"[warn] {endpoint.key:52} out of quota ({detail})")
+        elif response.status_code in (401, 403):
+            print(f"[warn] {endpoint.key:52} key rejected (HTTP {response.status_code})")
         elif response.status_code == 404:
-            print(f"[warn] {model:24} not served on this key (HTTP 404)")
+            print(f"[warn] {endpoint.key:52} not served on this key (HTTP 404)")
         else:
-            print(f"[FAIL] {model:24} HTTP {response.status_code}: {response.text[:120]}")
-    print(f"[info] {usable} of {len(models)} model(s) usable right now")
+            print(f"[FAIL] {endpoint.key:52} HTTP {response.status_code}: {response.text[:90]}")
+
+    print(f"[info] {usable} of {len(endpoints)} endpoint(s) usable right now")
     if not usable:
-        print("[info] add another model to ai.model_fallbacks in config/config.yaml, or use a paid key")
+        print("[info] free tiers are small - both free Gemini models allow only 20 requests/day each.")
+        print("[info] add a provider under ai.providers in config/config.yaml (Groq and OpenRouter")
+        print("[info] have free keys), or enable billing on your current key.")
     return 0 if usable else 1
 
 

@@ -38,8 +38,10 @@ export default function Guide() {
             <div>
               <strong>Collect</strong>
               <p>
-                Remote job APIs, company career boards, Ojiiz and the Nepali boards (merojob,
-                froxjob, jobaxle) are read through their public APIs and sitemaps.
+                Remote job APIs, company career boards, search engines and the Nepali boards
+                (merojob, froxjob, jobaxle, kumarijob, jobsnepal, merorojgari) are read through
+                their public APIs and sitemaps. <a href="#/sources">See every source and its
+                health</a>.
               </p>
             </div>
           </li>
@@ -83,7 +85,7 @@ export default function Guide() {
         <h2>Your routine</h2>
         <ol className="routine">
           <li>
-            Press <strong>Run now</strong> on the Overview, or let the 06:00 schedule do it.
+            Press <strong>Run scan now</strong> in the top bar, or let the 06:00 schedule do it.
           </li>
           <li>
             Open <a href="#/opportunities?view=needs_approval">Needs approval</a> and{" "}
@@ -100,7 +102,7 @@ export default function Guide() {
         </ol>
         {!hasRun && (
           <div className="notice info">
-            No runs yet &mdash; press <strong>Run now</strong> on the Overview to start the first
+            No runs yet &mdash; press <strong>Run scan now</strong> in the top bar to start the first
             one. The first run takes a while because every source is read from scratch.
           </div>
         )}
@@ -183,13 +185,18 @@ export default function Guide() {
                 <td>None</td>
               </tr>
               <tr>
-                <td>Ojiiz</td>
-                <td>Public listing API. Company names sit behind their paid unlock, so open the link to see the rest.</td>
+                <td>The Muse</td>
+                <td>Public API, filtered to entry level and internships</td>
                 <td>None</td>
               </tr>
               <tr>
-                <td>merojob, froxjob, jobaxle</td>
-                <td>Board sitemap, then the schema.org data every detail page carries</td>
+                <td>FindWork.dev</td>
+                <td>Needs a free key (<code>FINDWORK_API_KEY</code>); skipped until you set one</td>
+                <td>None</td>
+              </tr>
+              <tr>
+                <td>merojob, froxjob, jobaxle, kumarijob, jobsnepal, merorojgari</td>
+                <td>Board sitemap, then the schema.org data every detail page carries. This is where onsite Kathmandu roles come from.</td>
                 <td>None</td>
               </tr>
               <tr>

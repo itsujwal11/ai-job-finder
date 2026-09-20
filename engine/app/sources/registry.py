@@ -1,7 +1,7 @@
 """Maps fetch-task (kind, source) pairs to adapter functions."""
 from __future__ import annotations
 
-from . import ats, feeds, hackernews, local_boards, ojiiz, page, search
+from . import ats, feeds, free_apis, hackernews, local_boards, page, search
 from .base import Handler
 
 FEED_HANDLERS: dict[str, Handler] = {
@@ -12,7 +12,8 @@ FEED_HANDLERS: dict[str, Handler] = {
     "weworkremotely": feeds.fetch_weworkremotely,
     "workingnomads": feeds.fetch_workingnomads,
     "arbeitnow": feeds.fetch_arbeitnow,
-    "ojiiz": ojiiz.fetch_ojiiz,
+    "themuse": free_apis.fetch_themuse,
+    "findwork": free_apis.fetch_findwork,
 }
 
 

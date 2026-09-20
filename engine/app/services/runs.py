@@ -189,6 +189,38 @@ def compute_run_stats(run_id: int) -> dict[str, Any]:
     }
 
 
+def cleanup_old_data() -> dict[str, int]:
+    """Prune old jobs, raw urls, and fetch tasks to keep the database completely minimal."""
+    stats = {}
+    with db.connection() as conn:
+        # Delete rejected or untouched opportunities older than 14 days 
+        # (Except the ones the user actually cares about or applied to)
+        stats["deleted_opps"] = db.execute(
+            """
+            DELETE FROM opportunities 
+            WHERE first_seen_at < now() - interval '14 days'
+              AND review_status NOT IN ('applied', 'ready_to_apply', 'pending_approval', 'approved')
+            """,
+            conn=conn,
+        )
+        # Delete fetch tasks older than 14 days
+        stats["deleted_tasks"] = db.execute(
+            "DELETE FROM fetch_tasks WHERE created_at < now() - interval '14 days'",
+            conn=conn,
+        )
+        # Delete uninteresting URLs older than 14 days
+        stats["deleted_urls"] = db.execute(
+            "DELETE FROM discovered_urls WHERE first_seen_at < now() - interval '14 days' AND status <> 'lead_only'",
+            conn=conn,
+        )
+        # Delete runs older than 30 days (this cascades and deletes old ai_usage logs)
+        stats["deleted_runs"] = db.execute(
+            "DELETE FROM runs WHERE started_at < now() - interval '30 days'",
+            conn=conn,
+        )
+    return stats
+
+
 def finish_run(run_id: int) -> dict[str, Any]:
     from . import notify  # local import avoids a cycle
 
@@ -201,7 +233,12 @@ def finish_run(run_id: int) -> dict[str, Any]:
         (run_id,),
     )
     db.execute("UPDATE runs SET stage = 'notifying' WHERE id = %s", (run_id,))
+    
+    cleanup_stats = cleanup_old_data()
+    
     stats = compute_run_stats(run_id)
+    stats["cleanup"] = cleanup_stats
+    
     notifications = notify.send_run_digest(run_id, stats)
     db.execute(
         "UPDATE runs SET status = 'completed', stage = 'done', finished_at = now(), stats = stats || %s WHERE id = %s",

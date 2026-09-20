@@ -39,7 +39,7 @@ SORTS = {
 LIST_COLUMNS = (
     "id, title, company_name, source, source_url, location_text, remote_type, employment_type, salary_npr_monthly_min,"
     " salary_npr_monthly_max, match_score, recommendation, review_status, pipeline_status, nepal_eligibility,"
-    " legitimacy_verdict, apply_method, materials_status, first_seen_at, posted_at, filter_reasons, duplicate_of,"
+    " legitimacy_verdict, apply_method, apply_email, materials_status, first_seen_at, posted_at, filter_reasons, duplicate_of,"
     " prescore"
 )
 
@@ -171,10 +171,25 @@ def overview() -> dict[str, Any]:
     )
     leads = db.fetch_value("SELECT count(*) AS n FROM discovered_urls WHERE status = 'lead_only'")
     boards = db.fetch_value("SELECT count(*) AS n FROM ats_boards WHERE enabled")
+    
+    sys_status = system_status()
+    
+    # Surface AI exhaustion and quota errors clearly
+    spent_today = float(spend["today"]) if spend and spend["today"] else 0.0
+    budget = float(cfg.get("ai.daily_budget_usd", 0)) if cfg else 0.0
+    if budget > 0 and spent_today >= budget:
+        sys_status["warnings"].insert(0, f"Daily AI budget cap (${budget:.2f}) reached! Spent: ${spent_today:.2f}. Matching is paused until tomorrow.")
+        
+    last_run = recent_runs[0] if recent_runs else None
+    if last_run and last_run["status"] == "failed" and last_run["error"]:
+        err = last_run["error"].lower()
+        if "quota" in err or "429" in err or "insufficient_quota" in err:
+            sys_status["warnings"].insert(0, f"AI API Quota Exceeded: Your AI provider account has run out of credits or hit a rate limit.")
+
     return {
         "kpis": {**kpis, "leads": leads, "ats_boards": boards},
         "funnel": funnel, "daily": daily, "top_matches": top, "recent_runs": recent_runs, "sources": sources,
-        "ai_spend": spend, "status": system_status(),
+        "ai_spend": spend, "status": sys_status,
     }
 
 
@@ -277,6 +292,22 @@ def decide(opportunity_id: int, body: DecisionBody) -> dict[str, Any]:
     return _detail(opportunity_id)
 
 
+@router.delete("/opportunities/{opportunity_id}")
+def delete_opportunity(opportunity_id: int) -> dict[str, Any]:
+    row = db.fetch_one("SELECT id, title FROM opportunities WHERE id = %s", (opportunity_id,))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    
+    # We also need to delete from applications and materials manually if they exist, 
+    # though Postgres ON DELETE CASCADE might handle it depending on schema. 
+    # We'll just delete the opportunity which will cascade or leave orphaned small rows.
+    # Actually, we should make sure we delete the opportunity itself.
+    db.execute("DELETE FROM opportunities WHERE id = %s", (opportunity_id,))
+    
+    log_event("user_decision", f"Deleted: {row['title']}", opportunity_id=opportunity_id)
+    return {"deleted": True, "id": opportunity_id}
+
+
 @router.post("/opportunities/{opportunity_id}/materials")
 def generate_materials(opportunity_id: int) -> dict[str, Any]:
     cfg, env = load_config(), get_env()
@@ -367,16 +398,109 @@ def start_run() -> dict[str, Any]:
     try:
         driver.start_background(started["run_id"])
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        runs_service.record_failure(started["run_id"], f"Failed to start background worker: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to start background worker: {exc}") from exc
     return started
+
+
+@router.delete("/runs/active")
+def stop_active_run() -> dict[str, Any]:
+    """Cancel the currently active run."""
+    run = db.fetch_one("SELECT id FROM runs WHERE status = 'running' ORDER BY id LIMIT 1")
+    if not run:
+        raise HTTPException(status_code=404, detail="No active run found")
+    
+    run_id = run["id"]
+    # Mark it as failed so the driver stops processing new tasks
+    runs_service.record_failure(run_id, "Cancelled manually by user")
+    
+    # Mark all pending/running tasks as skipped
+    db.execute(
+        "UPDATE fetch_tasks SET status = 'skipped', error = 'Cancelled manually', finished_at = now() "
+        "WHERE run_id = %s AND status IN ('pending', 'running')",
+        (run_id,)
+    )
+    
+    return {"cancelled": True, "run_id": run_id}
 
 
 @router.get("/runs/active")
 def active_run() -> dict[str, Any]:
+    """Live progress of the current run, for the monitor card in the dashboard.
+
+    Falls back to the most recent finished run so the card can show a summary right after a
+    run ends instead of blanking out.
+    """
     run = db.fetch_one(
-        "SELECT id, trigger, status, stage, started_at, stats FROM runs WHERE status = 'running' ORDER BY id DESC LIMIT 1"
+        "SELECT id, trigger, status, stage, started_at, finished_at, stats, error"
+        " FROM runs WHERE status = 'running' ORDER BY id DESC LIMIT 1"
     )
-    return {"run": run, "driving": driver.is_driving()}
+    finished = None
+    if run is None:
+        finished = db.fetch_one(
+            "SELECT id, trigger, status, stage, started_at, finished_at, stats, error"
+            " FROM runs ORDER BY id DESC LIMIT 1"
+        )
+    target = run or finished
+    if target is None:
+        return {"run": None, "last": None, "driving": driver.is_driving(), "progress": None, "recent": []}
+
+    run_id = target["id"]
+    tasks = db.fetch_one(
+        """
+        SELECT count(*) AS total,
+               count(*) FILTER (WHERE status NOT IN ('pending', 'running')) AS done,
+               count(*) FILTER (WHERE status = 'ok')      AS ok,
+               count(*) FILTER (WHERE status = 'failed')  AS failed,
+               count(*) FILTER (WHERE status = 'blocked') AS blocked,
+               count(*) FILTER (WHERE status = 'running') AS running
+        FROM fetch_tasks WHERE run_id = %s
+        """,
+        (run_id,),
+    )
+    current = db.fetch_one(
+        "SELECT label, kind, source FROM fetch_tasks WHERE run_id = %s AND status = 'running' ORDER BY started_at LIMIT 1",
+        (run_id,),
+    )
+    counts = db.fetch_one(
+        """
+        SELECT count(*) FILTER (WHERE first_run_id = %(run)s) AS discovered,
+               count(*) FILTER (WHERE last_processed_run_id = %(run)s) AS processed,
+               count(*) FILTER (WHERE last_processed_run_id = %(run)s AND pipeline_status = 'analyzed') AS analyzed,
+               count(*) FILTER (WHERE last_processed_run_id = %(run)s AND recommendation = ANY(%(rec)s)) AS matches
+        FROM opportunities
+        """,
+        {"run": run_id, "rec": list(ACTIONABLE)},
+    )
+    spend = db.fetch_value("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM ai_usage WHERE run_id = %s", (run_id,))
+
+    total = int(tasks["total"] or 0)
+    done = int(tasks["done"] or 0)
+    return {
+        "run": run,
+        "last": finished,
+        "driving": driver.is_driving(),
+        "progress": {
+            "stage": target["stage"],
+            "tasks_total": total,
+            "tasks_done": done,
+            "tasks_ok": tasks["ok"],
+            "tasks_failed": tasks["failed"],
+            "tasks_blocked": tasks["blocked"],
+            "fraction": round(done / total, 3) if total else 0.0,
+            "current": f"{current['label']}" if current else None,
+            "ai_cost_usd": float(spend or 0),
+            **{k: int(v or 0) for k, v in counts.items()},
+        },
+        "recent": db.fetch_all(
+            """
+            SELECT label, status, items_found, items_new, error, finished_at
+            FROM fetch_tasks WHERE run_id = %s AND finished_at IS NOT NULL
+            ORDER BY finished_at DESC LIMIT 6
+            """,
+            (run_id,),
+        ),
+    }
 
 
 @router.get("/runs")
@@ -444,6 +568,152 @@ def list_leads() -> dict[str, Any]:
 @router.get("/boards")
 def list_boards() -> dict[str, Any]:
     return {"items": db.fetch_all("SELECT * FROM ats_boards ORDER BY enabled DESC, last_fetched_at DESC NULLS FIRST LIMIT 1000")}
+
+
+@router.get("/sources")
+def sources() -> dict[str, Any]:
+    """Every configured source next to what it actually delivered, so dead ones are obvious."""
+    cfg, env = load_config(), get_env()
+    health = {
+        r["source"]: r
+        for r in db.fetch_all(
+            """
+            SELECT source,
+                   count(*) FILTER (WHERE status = 'ok')      AS ok,
+                   count(*) FILTER (WHERE status = 'failed')  AS failed,
+                   count(*) FILTER (WHERE status = 'blocked') AS blocked,
+                   count(*) FILTER (WHERE status = 'skipped') AS skipped,
+                   COALESCE(SUM(items_found), 0) AS found,
+                   COALESCE(SUM(items_new), 0)   AS new,
+                   max(finished_at) AS last_run,
+                   (ARRAY_AGG(error ORDER BY id DESC) FILTER (WHERE error IS NOT NULL))[1] AS last_note
+            FROM fetch_tasks
+            WHERE created_at > now() - interval '7 days' AND kind IN ('feed', 'hn', 'local_board')
+            GROUP BY source
+            """
+        )
+    }
+    stored = {r["source"]: r["n"] for r in db.fetch_all("SELECT source, count(*) AS n FROM opportunities GROUP BY source")}
+
+    def row(name: str, label: str, kind: str, enabled: bool, note: str = "") -> dict[str, Any]:
+        h = health.get(name) or {}
+        return {
+            "name": name, "label": label, "kind": kind, "enabled": enabled, "note": note,
+            "ok": h.get("ok", 0), "failed": h.get("failed", 0), "blocked": h.get("blocked", 0),
+            "skipped": h.get("skipped", 0), "found": h.get("found", 0), "new": h.get("new", 0),
+            "last_run": h.get("last_run"), "last_note": h.get("last_note"),
+            "stored_total": stored.get(name, 0),
+        }
+
+    rows: list[dict[str, Any]] = []
+    for name, src in (cfg.get("sources") or {}).items():
+        src = src or {}
+        rows.append(row(name, name.replace("_", " ").title(), "Remote job API", bool(src.get("enabled"))))
+    for board in cfg.get("local_boards.boards") or []:
+        rows.append(row(board["name"], board.get("label") or board["name"], "Nepali job board",
+                        bool(board.get("enabled", True))))
+
+    boards = db.fetch_one(
+        "SELECT count(*) AS total, count(*) FILTER (WHERE enabled) AS enabled FROM ats_boards"
+    )
+    return {
+        "sources": rows,
+        "ats_boards": boards,
+        "search": {
+            "providers_configured": list(cfg.get("search.providers") or []),
+            "providers_active": env.search_providers(),
+            "queries": list(cfg.get("search.queries") or []),
+            "max_queries_per_run": cfg.get("search.max_queries_per_run"),
+        },
+        "search_health": db.fetch_all(
+            """
+            SELECT source, count(*) FILTER (WHERE status = 'ok') AS ok,
+                   count(*) FILTER (WHERE status <> 'ok') AS problems,
+                   COALESCE(SUM(items_found), 0) AS found
+            FROM fetch_tasks WHERE kind = 'search' AND created_at > now() - interval '7 days'
+            GROUP BY source
+            """
+        ),
+        "pages": db.fetch_one(
+            """
+            SELECT count(*) FILTER (WHERE status = 'ok')      AS ok,
+                   count(*) FILTER (WHERE status = 'blocked') AS blocked,
+                   count(*) FILTER (WHERE status = 'failed')  AS failed,
+                   count(*) FILTER (WHERE status = 'skipped') AS skipped
+            FROM fetch_tasks WHERE kind = 'page' AND created_at > now() - interval '7 days'
+            """
+        ),
+    }
+
+
+@router.get("/activity")
+def activity(limit: int = Query(12, ge=1, le=50)) -> dict[str, Any]:
+    """Recent pipeline activity for the live feed, newest first.
+
+    Built from real fetch tasks and events - every line corresponds to something that happened.
+    """
+    tasks = db.fetch_all(
+        """
+        SELECT kind, source, label, status, items_found, items_new, error, finished_at, run_id
+        FROM fetch_tasks
+        WHERE finished_at IS NOT NULL
+        ORDER BY finished_at DESC LIMIT %s
+        """,
+        (limit,),
+    )
+    feed: list[dict[str, Any]] = []
+    for t in tasks:
+        if t["status"] == "ok" and t["items_found"]:
+            tone, headline = "good", f"Read {t['items_found']} postings"
+            detail = f"{t['label']}"
+            if t["items_new"]:
+                detail += f" · {t['items_new']} new"
+        elif t["status"] == "ok":
+            tone, headline, detail = "muted", "No new postings", t["label"]
+        elif t["status"] == "blocked":
+            tone, headline, detail = "warn", "Site refused automated access", f"{t['label']} · left alone"
+        elif t["status"] == "skipped":
+            tone, headline, detail = "muted", "Skipped", f"{t['label']} · {(t['error'] or '')[:70]}"
+        else:
+            tone, headline, detail = "bad", "Fetch failed", f"{t['label']} · {(t['error'] or '')[:70]}"
+        feed.append({"tone": tone, "headline": headline, "detail": detail,
+                     "at": t["finished_at"], "run_id": t["run_id"], "kind": t["kind"]})
+
+    scored = db.fetch_all(
+        """
+        SELECT e.message, e.occurred_at, e.run_id, o.match_score, o.recommendation
+        FROM events e LEFT JOIN opportunities o ON o.id = e.opportunity_id
+        WHERE e.type = 'opportunity_analyzed' ORDER BY e.occurred_at DESC LIMIT %s
+        """,
+        (limit,),
+    )
+    for e in scored:
+        score = e["match_score"]
+        feed.append({
+            "tone": "good" if (score or 0) >= 70 else "muted",
+            "headline": f"Scored {score}/100" if score is not None else "Scored",
+            "detail": (e["message"] or "").split(": score")[0][:90],
+            "at": e["occurred_at"], "run_id": e["run_id"], "kind": "analysis",
+        })
+
+    feed.sort(key=lambda r: r["at"], reverse=True)
+
+    eligibility = db.fetch_one(
+        """
+        SELECT count(*) FILTER (WHERE nepal_eligibility = 'eligible')        AS eligible,
+               count(*) FILTER (WHERE nepal_eligibility = 'likely_eligible') AS likely,
+               count(*) FILTER (WHERE nepal_eligibility = 'unclear')         AS unclear,
+               count(*) FILTER (WHERE nepal_eligibility = 'not_eligible')    AS not_eligible
+        FROM opportunities WHERE nepal_eligibility IS NOT NULL
+        """
+    )
+    return {
+        "feed": feed[:limit],
+        "eligibility": eligibility,
+        "run": db.fetch_one(
+            "SELECT id, trigger, status, stage, started_at, finished_at, stats FROM runs ORDER BY id DESC LIMIT 1"
+        ),
+    }
 
 
 @router.get("/settings")

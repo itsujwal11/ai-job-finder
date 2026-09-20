@@ -126,6 +126,7 @@ class Env:
     tavily_api_key: str | None
     google_cse_api_key: str | None
     google_cse_cx: str | None
+    findwork_api_key: str | None
     telegram_bot_token: str | None
     telegram_chat_id: str | None
     smtp_host: str | None
@@ -154,6 +155,7 @@ class Env:
             tavily_api_key=_str("TAVILY_API_KEY"),
             google_cse_api_key=_str("GOOGLE_CSE_API_KEY"),
             google_cse_cx=_str("GOOGLE_CSE_CX"),
+            findwork_api_key=_str("FINDWORK_API_KEY"),
             telegram_bot_token=_str("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=_str("TELEGRAM_CHAT_ID"),
             smtp_host=_str("SMTP_HOST"),

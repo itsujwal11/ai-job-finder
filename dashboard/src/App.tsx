@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { api, useData, useHash } from "./api";
 import Guide from "./Guide";
+import Overview from "./Overview";
+import { Sidebar, TopBar } from "./Shell";
+import Sources from "./Sources";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Opp = Record<string, any>;
@@ -28,6 +31,18 @@ const ELIG: Record<string, string> = {
   unclear: "Eligibility unclear",
   not_eligible: "Not open to Nepal",
 };
+const VIEW_HELP: Record<string, string> = {
+  ready: "Passed every check and scored well. Open one, then apply on the company's own site.",
+  needs_approval: "Scored 70-84. Worth a look, but read the reasoning before you spend time on it.",
+  applied: "You marked these as applied. The same company and role is never suggested again.",
+  analyzed: "Everything the AI has scored, including the ones that did not make the cut.",
+  awaiting: "Queued for AI scoring, highest queue rank first. Usually the daily AI quota ran out — these are picked up on the next run.",
+  filtered: "Stopped by the free rules: wrong role, too senior, closed to Nepal, stale or scam-shaped. These never cost an AI call.",
+  rejected: "You rejected or dismissed these.",
+  duplicates: "The same role already stored from another source.",
+  all: "Every posting the system has stored.",
+};
+
 const VIEWS: [string, string][] = [
   ["ready", "Ready to apply"],
   ["needs_approval", "Needs approval"],
@@ -69,225 +84,40 @@ export default function App() {
   const detail = path.match(/^\/opportunities\/(\d+)/);
   const run = path.match(/^\/runs\/(\d+)/);
   const section = path.split("/")[1] || "";
+  const [runKey, setRunKey] = useState(0);
 
   return (
     <div className="shell">
-      <nav className="nav">
-        <div className="brand">🔎 Job Discovery</div>
-        {[["", "Overview"], ["opportunities", "Opportunities"], ["applications", "Applications"], ["runs", "Runs & logs"], ["guide", "How it works"]].map(([key, label]) => (
-          <a key={key} href={`#/${key}`} className={section === key ? "active" : ""}>{label}</a>
-        ))}
-      </nav>
+      <Sidebar section={section} />
       <main className="main">
+        <TopBar onRunFinished={() => setRunKey((k) => k + 1)} />
         {detail ? <Detail id={Number(detail[1])} /> :
          run ? <RunDetail id={Number(run[1])} /> :
-         section === "opportunities" ? <Opportunities view={params.get("view") || "ready"} /> :
-         section === "applications" ? <Applications /> :
-         section === "runs" ? <Runs /> :
-         section === "guide" ? <Guide /> : <Overview />}
+         section === "opportunities" ? <Opportunities key={runKey} view={params.get("view") || "ready"} q0={params.get("q") || ""} /> :
+         section === "applications" ? <ApplicationTracker /> :
+         section === "sources" ? <Sources /> :
+         section === "runs" ? <Runs key={runKey} /> :
+         section === "guide" ? <Guide /> : <Overview key={runKey} />}
       </main>
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-/** Starts a run in the engine and polls until it finishes. Works with or without n8n. */
-function RunNowButton({ onDone }: { onDone?: () => void }) {
-  const [state, setState] = useState<{ busy: boolean; stage?: string; error?: string }>({ busy: false });
-
-  useEffect(() => {
-    let live = true;
-    const poll = async () => {
-      try {
-        const d = await api<any>("/runs/active");
-        if (!live) return;
-        if (d.run) setState({ busy: true, stage: `run #${d.run.id} · ${d.run.stage}` });
-        else setState((s) => (s.busy ? (onDone?.(), { busy: false }) : s));
-      } catch {
-        /* keep the last state; the next tick retries */
-      }
-    };
-    poll();
-    const timer = setInterval(poll, 5000);
-    return () => { live = false; clearInterval(timer); };
-  }, [onDone]);
-
-  const start = async () => {
-    setState({ busy: true, stage: "starting" });
-    try {
-      const d = await api<any>("/runs", { method: "POST" });
-      setState({ busy: true, stage: `run #${d.run_id} · fetching` });
-    } catch (e) {
-      setState({ busy: false, error: (e as Error).message });
-    }
-  };
-
-  return (
-    <div className="run-now">
-      <button className="btn" onClick={start} disabled={state.busy}>
-        {state.busy ? `Running… ${state.stage ?? ""}` : "Run now"}
-      </button>
-      {state.error && <span className="run-now-error">{state.error}</span>}
-    </div>
-  );
-}
 
 // ---------------------------------------------------------------------------
-function Overview() {
-  const { data, error, reload } = useData<any>("/overview");
-  if (error) return <ErrorBox message={error} />;
-  if (!data) return <Loading />;
-  const { kpis, status, ai_spend } = data;
-  return (
-    <>
-      <header className="page-head">
-        <div>
-          <h1>Overview</h1>
-          <p className="sub">Remote & Nepal-eligible opportunities matched against your CV.</p>
-        </div>
-        <RunNowButton onDone={reload} />
-      </header>
-      {status.warnings.length > 0 && (
-        <div className="notice warn">
-          <strong>Setup to finish</strong>
-          <ul>{status.warnings.map((w: string) => <li key={w}>{w}</li>)}</ul>
-        </div>
-      )}
-      <div className="notice info">Automatic applications are <strong>off</strong> (phase 1). Nothing is ever sent — you review and apply yourself.</div>
-
-      <section className="tiles">
-        <Tile label="Ready to apply" value={kpis.ready_to_apply} href="#/opportunities?view=ready" />
-        <Tile label="Needs your approval" value={kpis.needs_approval} href="#/opportunities?view=needs_approval" />
-        <Tile label="Discovered (7 days)" value={kpis.discovered_7d} href="#/opportunities?view=all" />
-        <Tile label="Applied" value={kpis.applied} href="#/applications" />
-        <Tile label="AI spend today" value={`$${Number(ai_spend.today).toFixed(2)}`} note={`budget $${status.ai.daily_budget_usd.toFixed(2)}`} />
-      </section>
-
-      <div className="grid-2">
-        <section className="card">
-          <h2>Discovered per day</h2>
-          <p className="sub">Last 14 days · new postings found</p>
-          <BarChart rows={data.daily} />
-        </section>
-        <section className="card">
-          <h2>Last 7 days</h2>
-          <p className="sub">From discovery to a match worth your time</p>
-          <Funnel funnel={data.funnel} />
-        </section>
-      </div>
-
-      <section className="card">
-        <div className="card-head"><h2>Top matches</h2><a href="#/opportunities?view=ready">View all →</a></div>
-        {data.top_matches.length === 0 ? <Empty text="No matches yet. They appear after the first run with AI analysis." /> :
-          <div className="match-list">{data.top_matches.map((o: Opp) => <MatchRow key={o.id} o={o} />)}</div>}
-      </section>
-
-      <div className="grid-2">
-        <section className="card">
-          <div className="card-head"><h2>Recent runs</h2><a href="#/runs">All runs →</a></div>
-          <RunsTable rows={data.recent_runs} />
-        </section>
-        <section className="card">
-          <h2>Source health (7 days)</h2>
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>Source</th><th className="num">OK</th><th className="num">Failed</th><th className="num">Blocked</th><th className="num">Found</th><th className="num">New</th></tr></thead>
-              <tbody>{data.sources.map((s: any) => (
-                <tr key={s.name}><td>{s.name}</td><td className="num">{s.ok}</td><td className="num">{s.failed}</td><td className="num">{s.blocked}</td><td className="num">{s.found}</td><td className="num">{s.new}</td></tr>
-              ))}</tbody>
-            </table>
-          </div>
-        </section>
-      </div>
-    </>
-  );
-}
-
-function Tile({ label, value, note, href }: { label: string; value: any; note?: string; href?: string }) {
-  const body = <><span className="tile-label">{label}</span><span className="tile-value">{value}</span>{note && <span className="tile-note">{note}</span>}</>;
-  return href ? <a className="tile" href={href}>{body}</a> : <div className="tile">{body}</div>;
-}
-
-function BarChart({ rows }: { rows: { day: string; discovered: number; matches: number }[] }) {
-  const [hover, setHover] = useState<number | null>(null);
-  const max = Math.max(1, ...rows.map((r) => r.discovered));
-  const niceMax = Math.ceil(max / 5) * 5 || 5;
-  const w = 560, h = 180, pad = { l: 32, b: 22, t: 8 }, band = (w - pad.l) / rows.length, bar = Math.min(24, band * 0.6);
-  const y = (v: number) => pad.t + (h - pad.t - pad.b) * (1 - v / niceMax);
-  return (
-    <div className="chart">
-      <svg viewBox={`0 0 ${w} ${h}`} role="img" aria-label="Postings discovered per day">
-        {[0, niceMax / 2, niceMax].map((t) => (
-          <g key={t}><line x1={pad.l} x2={w} y1={y(t)} y2={y(t)} className="grid" /><text x={pad.l - 6} y={y(t) + 4} className="axis" textAnchor="end">{t}</text></g>
-        ))}
-        {rows.map((r, i) => {
-          const x = pad.l + i * band + (band - bar) / 2, top = y(r.discovered), base = y(0), height = base - top;
-          const rr = Math.min(4, height);
-          const d = height <= 0 ? "" : `M${x},${base} V${top + rr} Q${x},${top} ${x + rr},${top} H${x + bar - rr} Q${x + bar},${top} ${x + bar},${top + rr} V${base} Z`;
-          return (
-            <g key={r.day} onPointerEnter={() => setHover(i)} onPointerLeave={() => setHover(null)}>
-              <rect x={pad.l + i * band} y={pad.t} width={band} height={h - pad.t - pad.b} fill="transparent" />
-              {d && <path d={d} className={`bar ${hover === i ? "hot" : ""}`} />}
-              {(i % 2 === 1 || rows.length < 8) && <text x={x + bar / 2} y={h - 6} className="axis" textAnchor="middle">{r.day.slice(8)}</text>}
-            </g>
-          );
-        })}
-      </svg>
-      {hover != null && (
-        <div className="tooltip" style={{ left: `${((pad.l + hover * band + band / 2) / w) * 100}%` }}>
-          <strong>{rows[hover].discovered}</strong> discovered<br /><strong>{rows[hover].matches}</strong> matches<br /><span>{fmtDate(rows[hover].day)}</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function Funnel({ funnel }: { funnel: any }) {
-  const steps: [string, number][] = [
-    ["Discovered", funnel.discovered], ["Unique postings", funnel.unique_postings], ["Passed filters", funnel.passed_filters],
-    ["Analysed by AI", funnel.analyzed], ["Matches (70+)", funnel.matches], ["Strong matches (85+)", funnel.strong_matches],
-  ];
-  const max = Math.max(1, steps[0][1]);
-  return (
-    <div className="funnel">
-      {steps.map(([label, n]) => (
-        <div key={label} className="funnel-row">
-          <span className="funnel-label">{label}</span>
-          <span className="funnel-track"><span className="funnel-bar" style={{ width: `${Math.max(n ? 2 : 0, (n / max) * 100)}%` }} /></span>
-          <span className="funnel-value">{n}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function MatchRow({ o }: { o: Opp }) {
-  return (
-    <a className="match" href={`#/opportunities/${o.id}`}>
-      <Score value={o.match_score} />
-      <span className="match-main">
-        <span className="match-title">{o.title}</span>
-        <span className="match-meta">{o.company_name || "Unknown company"} · {o.remote_type} · {o.employment_type?.replace("_", " ")} {salary(o) && `· ${salary(o)}`}</span>
-      </span>
-      <span className="match-chips">
-        <Chip tone={eligTone(o.nepal_eligibility)}>{ELIG[o.nepal_eligibility] ?? ""}</Chip>
-        <Chip tone={o.recommendation === "blocked" ? "bad" : "neutral"}>{REVIEW[o.review_status] || REC[o.recommendation] || o.pipeline_status}</Chip>
-      </span>
-    </a>
-  );
-}
-
-// ---------------------------------------------------------------------------
-function Opportunities({ view }: { view: string }) {
-  const [q, setQ] = useState("");
-  const [search, setSearch] = useState("");
+function Opportunities({ view, q0 = "" }: { view: string; q0?: string }) {
+  const [q, setQ] = useState(q0);
+  const [search, setSearch] = useState(q0);
   const [sort, setSort] = useState("score");
   const [page, setPage] = useState(1);
   const { data, error } = useData<any>(`/opportunities?view=${view}&sort=${sort}&page=${page}&page_size=25${search ? `&q=${encodeURIComponent(search)}` : ""}`);
   return (
     <>
       <header className="page-head">
-        <h1>Opportunities</h1>
+        <div>
+          <h1>Opportunities</h1>
+          <p className="sub">{VIEW_HELP[view] ?? "Every posting the system has stored."}</p>
+        </div>
         <a className="btn ghost" href="/api/ui/export/opportunities.csv">Export CSV</a>
       </header>
       <div className="tabs">
@@ -300,7 +130,10 @@ function Opportunities({ view }: { view: string }) {
       <form className="filters" onSubmit={(e) => { e.preventDefault(); setSearch(q); setPage(1); }}>
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search title or company" />
         <select value={sort} onChange={(e) => setSort(e.target.value)}>
-          <option value="score">Best match</option><option value="newest">Newest found</option><option value="posted">Recently posted</option>
+          <option value="score">Best match</option>
+          <option value="prescore">Queue order (next for AI)</option>
+          <option value="newest">Newest found</option>
+          <option value="posted">Recently posted</option>
         </select>
         <button className="btn">Search</button>
       </form>
@@ -309,16 +142,18 @@ function Opportunities({ view }: { view: string }) {
         <section className="card flush">
           <div className="table-wrap">
             <table className="clickable">
-              <thead><tr><th>Score</th><th>Role</th><th>Status</th><th>Nepal</th><th>Pay</th><th>Source</th><th>Found</th></tr></thead>
+              <thead><tr><th title="0-100 AI match score">Score</th><th>Role</th><th>Status</th><th>Nepal</th><th>Pay</th><th>Email</th><th>Source</th><th title="Rule-based queue rank used before AI scoring">Queue</th><th>Found</th></tr></thead>
               <tbody>
                 {data.items.map((o: Opp) => (
                   <tr key={o.id} onClick={() => (window.location.hash = `#/opportunities/${o.id}`)}>
                     <td><Score value={o.match_score} /></td>
-                    <td><div className="cell-title">{o.title}</div><div className="cell-sub">{o.company_name || "Unknown company"} · {o.remote_type}{o.filter_reasons?.length ? ` · ${o.filter_reasons[0]}` : ""}</div></td>
+                    <td><div className="cell-title">{o.title}</div><div className="cell-sub">{[o.company_name || "Company not stated", o.remote_type !== "unknown" ? o.remote_type : null, o.filter_reasons?.[0]].filter(Boolean).join(" · ")}</div></td>
                     <td><Chip tone={o.recommendation === "blocked" ? "bad" : "neutral"}>{REVIEW[o.review_status] || REC[o.recommendation] || o.pipeline_status.replace("_", " ")}</Chip></td>
                     <td><Chip tone={eligTone(o.nepal_eligibility)}>{ELIG[o.nepal_eligibility] ?? ""}</Chip></td>
                     <td className="nowrap">{salary(o)}</td>
-                    <td>{o.source}</td>
+                    <td>{o.apply_email ? <a href={`mailto:${o.apply_email}`} onClick={(e) => e.stopPropagation()} title={o.apply_email}>✉</a> : "—"}</td>
+                    <td className="src">{o.source}</td>
+                    <td className="num dim">{o.match_score == null ? (o.prescore ?? "—") : "—"}</td>
                     <td className="nowrap">{fmtDate(o.first_seen_at)}</td>
                   </tr>
                 ))}
@@ -379,12 +214,30 @@ function Detail({ id }: { id: number }) {
           </div>
           <div className="links">
             <a className="btn" href={o.source_url} target="_blank" rel="noreferrer">Open posting ↗</a>
-            {o.apply_email ? <a className="btn ghost" href={`mailto:${o.apply_email}`}>Email: {o.apply_email}</a> :
-             o.apply_url && o.apply_url !== o.source_url ? <a className="btn ghost" href={o.apply_url} target="_blank" rel="noreferrer">Apply page ↗</a> : null}
+            {o.apply_url && o.apply_url !== o.source_url ? <a className="btn ghost" href={o.apply_url} target="_blank" rel="noreferrer">Apply page ↗</a> : null}
             <span className="sub">Apply method: {o.apply_method.replace("_", " ")}</span>
           </div>
         </div>
       </header>
+
+      {/* --- Send your CV section --- */}
+      {(o.apply_email || a?.application_email) && (
+        <section className="card" style={{ borderLeft: "3px solid var(--accent)" }}>
+          <h2>📧 Send your CV here</h2>
+          <p style={{ fontSize: "1.1em", margin: "0.5em 0" }}>
+            <a className="btn good" href={`mailto:${o.apply_email || a.application_email}?subject=Application for ${encodeURIComponent(o.title)}${o.company_name ? ` at ${encodeURIComponent(o.company_name)}` : ""}`}>
+              ✉ {o.apply_email || a.application_email}
+            </a>
+          </p>
+          {a?.application_instructions && (
+            <p className="sub"><strong>How to apply:</strong> {a.application_instructions}</p>
+          )}
+          <p className="sub">
+            {m ? "Download your tailored CV and cover letter below, then attach them to this email."
+              : "Generate your tailored CV and cover letter first (button below), then send them to this email."}
+          </p>
+        </section>
+      )}
 
       <section className="card actions">
         <input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Optional note (saved with your decision)" />
@@ -395,7 +248,20 @@ function Detail({ id }: { id: number }) {
           <button className="btn ghost" disabled={!!busy} onClick={() => decide("dismiss")}>Dismiss</button>
           <button className="btn ghost" disabled={!!busy} onClick={() => decide("reopen")}>Reopen</button>
           <button className="btn ghost" disabled={!!busy || !a} onClick={() => act("materials", `/opportunities/${id}/materials`)}>
-            {busy === "materials" ? "Generating… (1–3 min)" : m ? "Regenerate CV & letter" : "Generate CV & letter"}
+            {busy === "materials" ? "Generating…" : m ? "Regenerate CV & cover letter" : "Generate CV & cover letter"}
+          </button>
+          <button 
+            className="btn ghost" 
+            style={{ color: "var(--bad)", borderColor: "transparent", marginLeft: "auto" }} 
+            disabled={!!busy} 
+            onClick={async () => {
+              if (window.confirm("Permanently delete this opportunity from the database? This cannot be undone.")) {
+                await api(`/opportunities/${id}`, { method: "DELETE" });
+                window.location.hash = "#/opportunities";
+              }
+            }}
+          >
+            🗑 Delete from DB
           </button>
         </div>
         {actionError && <div className="notice bad">{actionError}</div>}
@@ -430,7 +296,7 @@ function Detail({ id }: { id: number }) {
           <section className="card">
             <h2>Requirements you meet</h2>
             {a.matched_requirements.map((r: any, i: number) => (
-              <div key={i} className="req"><strong>{r.requirement}</strong> <Chip tone={r.strength === "strong" ? "good" : "warn"}>{r.strength}</Chip><p className="quote">“{r.cv_evidence}”</p></div>
+              <div key={i} className="req"><strong>{r.requirement}</strong> <Chip tone={r.strength === "strong" ? "good" : "warn"}>{r.strength}</Chip><p className="quote">"{r.cv_evidence}"</p></div>
             ))}
           </section>
           <section className="card">
@@ -483,35 +349,153 @@ function Detail({ id }: { id: number }) {
 }
 
 // ---------------------------------------------------------------------------
-function Applications() {
+// APPLICATION TRACKER — Premium kanban-style UI
+// ---------------------------------------------------------------------------
+const STATUS_COLUMNS: { key: string; label: string; color: string; icon: string; emptyText: string }[] = [
+  { key: "applied", label: "Applied", color: "var(--accent)", icon: "📨", emptyText: "No applications yet" },
+  { key: "interviewing", label: "Interviewing", color: "var(--warn)", icon: "💬", emptyText: "No interviews yet" },
+  { key: "offer", label: "Offers", color: "var(--good)", icon: "🎉", emptyText: "No offers yet" },
+  { key: "rejected", label: "Rejected", color: "var(--bad)", icon: "✗", emptyText: "None rejected" },
+  { key: "no_response", label: "No Response", color: "var(--muted)", icon: "⏳", emptyText: "All responded" },
+  { key: "withdrawn", label: "Withdrawn", color: "var(--border)", icon: "↩", emptyText: "None withdrawn" },
+];
+
+function ApplicationTracker() {
   const { data, error, reload } = useData<any>("/applications");
+  const [page, setPage] = useState(1);
+
   const update = async (id: number, status: string) => {
     await api(`/applications/${id}`, { method: "PATCH", body: JSON.stringify({ status }) });
     reload();
   };
+
+  if (error) return <ErrorBox message={error} />;
+  if (!data) return <Loading />;
+
+  const items = data.items || [];
+  const grouped: Record<string, any[]> = {};
+  STATUS_COLUMNS.forEach((c) => { grouped[c.key] = []; });
+  items.forEach((a: any) => {
+    if (grouped[a.status]) grouped[a.status].push(a);
+    else grouped["applied"].push(a);
+  });
+
+  // Stats
+  const total = items.length;
+  const interviewing = grouped["interviewing"].length;
+  const offers = grouped["offer"].length;
+  const responseRate = total > 0 ? Math.round(((interviewing + offers + grouped["rejected"].length) / total) * 100) : 0;
+
+  // Pagination
+  const PAGE_SIZE = 12;
+  const totalPages = Math.ceil(total / PAGE_SIZE);
+  const start = (page - 1) * PAGE_SIZE;
+  const paginatedItems = items.slice(start, start + PAGE_SIZE);
+
   return (
     <>
-      <header className="page-head"><h1>Applications</h1><p className="sub">Every application you recorded. Duplicate applications are blocked.</p></header>
-      {error && <ErrorBox message={error} />}
-      {!data ? <Loading /> : data.items.length === 0 ? <Empty text="No applications yet. Open an opportunity and click “I applied” after applying." /> : (
-        <section className="card flush"><div className="table-wrap"><table>
-          <thead><tr><th>Applied</th><th>Role</th><th>Score</th><th>Status</th></tr></thead>
-          <tbody>{data.items.map((a: any) => (
-            <tr key={a.id}>
-              <td className="nowrap">{fmtDate(a.applied_at)}</td>
-              <td><a href={`#/opportunities/${a.opportunity_id}`} className="cell-title">{a.title}</a><div className="cell-sub">{a.company_name}</div></td>
-              <td><Score value={a.match_score} /></td>
-              <td><select value={a.status} onChange={(e) => update(a.id, e.target.value)}>
-                {["applied", "interviewing", "offer", "rejected", "no_response", "withdrawn"].map((s) => <option key={s} value={s}>{s.replace("_", " ")}</option>)}
-              </select></td>
-            </tr>
-          ))}</tbody>
-        </table></div></section>
+      <header className="page-head">
+        <div>
+          <h1>Application Tracker</h1>
+          <p className="sub">Track every application from submission to outcome. Mark a job as "I applied" to add it here.</p>
+        </div>
+      </header>
+
+      {total === 0 ? (
+        <div className="tracker-empty-state">
+          <div className="tracker-empty-icon">📋</div>
+          <div className="tracker-empty-title">No applications yet</div>
+          <div className="tracker-empty-desc">
+            When you find a great opportunity, open it and click <strong>"I applied"</strong> after submitting your application. It will appear here so you can track its progress.
+          </div>
+          <a className="btn" href="#/opportunities?view=ready">Browse opportunities →</a>
+        </div>
+      ) : (
+        <>
+          <div className="tracker-stats">
+            <div className="tracker-stat">
+              <div className="tracker-stat-value">{total}</div>
+              <div className="tracker-stat-label">Total Applied</div>
+            </div>
+            <div className="tracker-stat">
+              <div className="tracker-stat-value warn">{interviewing}</div>
+              <div className="tracker-stat-label">Interviewing</div>
+            </div>
+            <div className="tracker-stat">
+              <div className="tracker-stat-value good">{offers}</div>
+              <div className="tracker-stat-label">Offers</div>
+            </div>
+            <div className="tracker-stat">
+              <div className="tracker-stat-value">{responseRate}%</div>
+              <div className="tracker-stat-label">Response Rate</div>
+            </div>
+            <div className="tracker-stat">
+              <div className="tracker-stat-value">{grouped["no_response"].length}</div>
+              <div className="tracker-stat-label">Awaiting Reply</div>
+            </div>
+          </div>
+
+          <section className="card flush">
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Applied</th>
+                    <th>Role & Company</th>
+                    <th>Score</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {paginatedItems.map((a: any, i: number) => (
+                    <tr key={a.id} style={{ animationDelay: `${i * 0.02}s` }} className="animate-fade-up">
+                      <td className="nowrap">{fmtDate(a.applied_at)}</td>
+                      <td>
+                        <a href={`#/opportunities/${a.opportunity_id}`} className="cell-title">{a.title}</a>
+                        <div className="cell-sub">{a.company_name}</div>
+                      </td>
+                      <td><Score value={a.match_score} /></td>
+                      <td style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                        <select className="status-select" value={a.status} onChange={(e) => update(a.id, e.target.value)}>
+                          {STATUS_COLUMNS.map((s) => (
+                            <option key={s.key} value={s.key}>{s.label}</option>
+                          ))}
+                        </select>
+                        <button 
+                          className="btn ghost small" 
+                          style={{ padding: "6px", color: "var(--bad)", borderColor: "transparent" }}
+                          onClick={async () => {
+                            if (window.confirm("Delete this opportunity completely from the database?")) {
+                              await api(`/opportunities/${a.opportunity_id}`, { method: "DELETE" });
+                              reload();
+                            }
+                          }}
+                          title="Delete from database"
+                        >
+                          🗑️
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            
+            {totalPages > 1 && (
+              <div className="pagination">
+                <button className="btn ghost small" disabled={page === 1} onClick={() => setPage(page - 1)}>← Previous</button>
+                <span className="page-info">Page {page} of {totalPages}</span>
+                <button className="btn ghost small" disabled={page === totalPages} onClick={() => setPage(page + 1)}>Next →</button>
+              </div>
+            )}
+          </section>
+        </>
       )}
     </>
   );
 }
 
+// ---------------------------------------------------------------------------
 function Runs() {
   const { data, error } = useData<any>("/runs");
   const events = useData<any>("/events?level=error&limit=20");
